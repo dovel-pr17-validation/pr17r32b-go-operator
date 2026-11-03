@@ -1,0 +1,1178 @@
+package build
+
+import (
+	"path"
+	"sort"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+
+	vmv1 "github.com/VictoriaMetrics/operator/api/operator/v1"
+	vmv1beta1 "github.com/VictoriaMetrics/operator/api/operator/v1beta1"
+	"github.com/VictoriaMetrics/operator/internal/config"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/k8stools"
+)
+
+type testBuildProbeCR struct {
+	probePath        string
+	port             string
+	scheme           string
+	useProxyProtocol bool
+	needAddLiveness  bool
+}
+
+func (t testBuildProbeCR) ProbePath() string {
+	return t.probePath
+}
+
+func (t testBuildProbeCR) ProbeScheme() string {
+	return t.scheme
+}
+
+func (t testBuildProbeCR) ProbePort() string {
+	return t.port
+}
+
+func (t testBuildProbeCR) ProbeNeedLiveness() bool {
+	return t.needAddLiveness
+}
+
+func (t testBuildProbeCR) UseProxyProtocol() bool {
+	return t.useProxyProtocol
+}
+
+func Test_buildProbe(t *testing.T) {
+	type opts struct {
+		container corev1.Container
+		cr        testBuildProbeCR
+		validate  func(corev1.Container)
+		params    vmv1beta1.CommonAppsParams
+	}
+	f := func(o opts) {
+		t.Helper()
+		Probe(&o.container, o.cr, &o.params)
+		o.validate(o.container)
+	}
+
+	// build default probe with empty ep
+	f(opts{
+		cr: testBuildProbeCR{
+			probePath:       "/health",
+			port:            "8051",
+			needAddLiveness: true,
+			scheme:          "HTTP",
+		},
+		container: corev1.Container{},
+		validate: func(container corev1.Container) {
+			assert.NotNil(t, container.LivenessProbe)
+			assert.NotNil(t, container.ReadinessProbe)
+			assert.Equal(t, corev1.URIScheme("HTTP"), container.ReadinessProbe.HTTPGet.Scheme)
+			assert.Nil(t, container.StartupProbe)
+		},
+	})
+
+	// build default probe with empty ep using HTTPS
+	f(opts{
+		cr: testBuildProbeCR{
+			probePath:       "/health",
+			port:            "8051",
+			needAddLiveness: true,
+			scheme:          "HTTPS",
+		},
+		container: corev1.Container{},
+		validate: func(container corev1.Container) {
+			assert.Nil(t, container.LivenessProbe)
+			assert.Nil(t, container.ReadinessProbe)
+			require.NotNil(t, container.StartupProbe)
+			require.NotNil(t, container.StartupProbe.TCPSocket)
+			assert.Equal(t, intstr.Parse("8051"), container.StartupProbe.TCPSocket.Port)
+		},
+	})
+
+	// build default probe with ep
+	f(opts{
+		cr: testBuildProbeCR{
+			probePath:       "/health",
+			port:            "8051",
+			needAddLiveness: true,
+		},
+		params: vmv1beta1.CommonAppsParams{
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: []string{"echo", "1"},
+					},
+				},
+			},
+			StartupProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Host: "some",
+					},
+				},
+			},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path: "/live1",
+					},
+				},
+				TimeoutSeconds:      15,
+				InitialDelaySeconds: 20,
+			},
+		},
+		container: corev1.Container{},
+		validate: func(container corev1.Container) {
+			assert.NotNil(t, container.LivenessProbe)
+			assert.Equal(t, "/live1", container.LivenessProbe.HTTPGet.Path)
+			assert.Equal(t, int32(20), container.LivenessProbe.InitialDelaySeconds)
+			assert.Equal(t, int32(15), container.LivenessProbe.TimeoutSeconds)
+			assert.NotNil(t, container.ReadinessProbe)
+			assert.Len(t, container.ReadinessProbe.Exec.Command, 2)
+			assert.NotNil(t, container.StartupProbe)
+			assert.Equal(t, "some", container.StartupProbe.HTTPGet.Host)
+		},
+	})
+}
+
+func Test_addExtraArgsOverrideDefaults(t *testing.T) {
+	type opts struct {
+		args      []string
+		extraArgs map[string]string
+		dashes    string
+		want      []string
+	}
+	f := func(o opts) {
+		t.Helper()
+		assert.Equalf(
+			t,
+			o.want,
+			AddExtraArgsOverrideDefaults(o.args, o.extraArgs, o.dashes),
+			"addExtraArgsOverrideDefaults(%v, %v)", o.args, o.extraArgs)
+	}
+
+	// no changes
+	f(opts{
+		args:   []string{"-http.ListenAddr=:8081"},
+		dashes: "-",
+		want:   []string{"-http.ListenAddr=:8081"},
+	})
+
+	// override default
+	f(opts{
+		args:      []string{"-http.ListenAddr=:8081"},
+		extraArgs: map[string]string{"http.ListenAddr": "127.0.0.1:8085"},
+		dashes:    "-",
+		want:      []string{"-http.ListenAddr=127.0.0.1:8085"},
+	})
+
+	// override default, add to the end
+	f(opts{
+		args:      []string{"-http.ListenAddr=:8081", "-promscrape.config=/opt/vmagent.yml"},
+		extraArgs: map[string]string{"http.ListenAddr": "127.0.0.1:8085"},
+		dashes:    "-",
+		want:      []string{"-promscrape.config=/opt/vmagent.yml", "-http.ListenAddr=127.0.0.1:8085"},
+	})
+
+	// two dashes, extend
+	f(opts{
+		args:      []string{"--web.timeout=0"},
+		extraArgs: map[string]string{"log.level": "debug"},
+		dashes:    "--",
+		want:      []string{"--web.timeout=0", "--log.level=debug"},
+	})
+
+	// two dashes, override default
+	f(opts{
+		args:      []string{"--log.level=info"},
+		extraArgs: map[string]string{"log.level": "debug"},
+		dashes:    "--",
+		want:      []string{"--log.level=debug"},
+	})
+
+	// two dashes, alertmanager migration
+	f(opts{
+		args:      []string{"--log.level=info"},
+		extraArgs: map[string]string{"-web.externalURL": "http://domain.example"},
+		dashes:    "--",
+		want:      []string{"--log.level=info", "--web.externalURL=http://domain.example"},
+	})
+}
+
+func TestLifecycle(t *testing.T) {
+	f := func(params *vmv1beta1.CommonAppsParams, wantPreStop *corev1.LifecycleHandler) {
+		t.Helper()
+		var container corev1.Container
+		Lifecycle(&container, params)
+		if wantPreStop == nil {
+			assert.Nil(t, container.Lifecycle)
+			return
+		}
+		require.NotNil(t, container.Lifecycle)
+		assert.Equal(t, wantPreStop, container.Lifecycle.PreStop)
+	}
+	// nil params — no hook
+	f(nil, nil)
+	// nil PreStopSleepSeconds — no hook
+	f(&vmv1beta1.CommonAppsParams{}, nil)
+	// zero — no hook
+	f(&vmv1beta1.CommonAppsParams{PreStopSleepSeconds: ptr.To[int32](0)}, nil)
+
+	// unsupported k8s version — no hook even with seconds set
+	k8stools.ServerMajorVersion = 1
+	k8stools.ServerMinorVersion = 28
+	f(&vmv1beta1.CommonAppsParams{PreStopSleepSeconds: ptr.To[int32](15)}, nil)
+
+	// PodLifecycleSleepAction is alpha (off by default) in 1.29 — must not set an empty handler
+	k8stools.ServerMinorVersion = 29
+	f(&vmv1beta1.CommonAppsParams{PreStopSleepSeconds: ptr.To[int32](15)}, nil)
+
+	// supported k8s version (>= 1.30) — native SleepAction
+	k8stools.ServerMajorVersion = 1
+	k8stools.ServerMinorVersion = 30
+	t.Cleanup(func() { k8stools.ServerMajorVersion = 0; k8stools.ServerMinorVersion = 0 })
+
+	// sleep >= terminationGracePeriodSeconds — no hook to avoid SIGKILL during preStop
+	f(&vmv1beta1.CommonAppsParams{
+		PreStopSleepSeconds:           ptr.To[int32](15),
+		TerminationGracePeriodSeconds: ptr.To[int64](15),
+	}, nil)
+	f(&vmv1beta1.CommonAppsParams{
+		PreStopSleepSeconds:           ptr.To[int32](30),
+		TerminationGracePeriodSeconds: ptr.To[int64](15),
+	}, nil)
+
+	// sleep < terminationGracePeriodSeconds — hook applied
+	f(&vmv1beta1.CommonAppsParams{
+		PreStopSleepSeconds:           ptr.To[int32](15),
+		TerminationGracePeriodSeconds: ptr.To[int64](30),
+	}, &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: 15}})
+
+	// no terminationGracePeriodSeconds set — hook applied (nil means no constraint)
+	f(&vmv1beta1.CommonAppsParams{PreStopSleepSeconds: ptr.To[int32](15)}, &corev1.LifecycleHandler{
+		Sleep: &corev1.SleepAction{Seconds: 15},
+	})
+	// custom value with sufficient grace period
+	f(&vmv1beta1.CommonAppsParams{
+		PreStopSleepSeconds:           ptr.To[int32](30),
+		TerminationGracePeriodSeconds: ptr.To[int64](60),
+	}, &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: 30}})
+	// user-defined preStop not overwritten
+	userPreStop := &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"my-shutdown.sh"}}}
+	container := corev1.Container{Lifecycle: &corev1.Lifecycle{PreStop: userPreStop}}
+	Lifecycle(&container, &vmv1beta1.CommonAppsParams{PreStopSleepSeconds: ptr.To[int32](15)})
+	assert.Equal(t, userPreStop, container.Lifecycle.PreStop)
+}
+
+func TestFormatContainerImage(t *testing.T) {
+	f := func(globalRepo, image, wantImage string) {
+		t.Helper()
+		gotImage := formatContainerImage(globalRepo, image)
+		assert.Equal(t, wantImage, gotImage)
+	}
+	f("", "victoria-metrics/storage", "victoria-metrics/storage")
+	f("docker.io", "victoria-metrics/storage", "docker.io/victoria-metrics/storage")
+	// strip quay and replace with global repo
+	f("docker.io", "quay.io/prometheus-operator/prometheus-config-reloader:v0.82.1", "quay.io/prometheus-operator/prometheus-config-reloader:v0.82.1")
+	f("private.github.io", "victoria-metrics/storage", "private.github.io/victoria-metrics/storage")
+	// for private repo
+	f("private.github.io", "quay.io/prometheus-operator/prometheus-config-reloader:v0.82.1", "quay.io/prometheus-operator/prometheus-config-reloader:v0.82.1")
+	// edge case
+	f("private.github.io", "quay.io/victoria-metrics/storage", "quay.io/victoria-metrics/storage")
+	// replace registry
+	f("private.github.io", "my-private.registry/victoria-metrics/storage", "my-private.registry/victoria-metrics/storage")
+	f("docker.proxy.org/public-repo-proxy-docker-hub", "docker.proxy.org/public-repo-proxy-docker-hub/victoriametrics/vmauth", "docker.proxy.org/public-repo-proxy-docker-hub/victoriametrics/vmauth")
+	// library image
+	f("docker.io/library/", "alpine", "docker.io/library/alpine")
+}
+
+func TestAddSyslogArgsTo(t *testing.T) {
+	f := func(syslogSpec *vmv1.SyslogServerSpec, wantArgs []string) {
+		t.Helper()
+		args := AddSyslogArgsTo(nil, syslogSpec, "/etc/vm/tls-server-secrets")
+		sort.Strings(args)
+		sort.Strings(wantArgs)
+		assert.Equal(t, wantArgs, args)
+	}
+	f(nil, nil)
+	// multiple tcp listeners
+	spec := vmv1.SyslogServerSpec{
+		TCPListeners: []*vmv1.SyslogTCPListener{
+			{
+				ListenPort: 3001,
+			},
+			{
+				ListenPort:   3002,
+				StreamFields: vmv1.FieldsListString(`["msg_1","msg_2"]`),
+			},
+		},
+	}
+	expected := []string{
+		"-syslog.listenAddr.tcp=:3001,:3002",
+		`-syslog.streamFields.tcp='','["msg_1","msg_2"]'`,
+	}
+	f(&spec, expected)
+
+	// multiple udp listeners
+	spec = vmv1.SyslogServerSpec{
+		UDPListeners: []*vmv1.SyslogUDPListener{
+			{
+				ListenPort:   3001,
+				IgnoreFields: vmv1.FieldsListString(`["ignore_1"]`),
+			},
+			{
+				ListenPort:   3002,
+				StreamFields: vmv1.FieldsListString(`["msg_1","msg_2"]`),
+			},
+			{
+				ListenPort: 3005,
+			},
+		},
+	}
+	expected = []string{
+		"-syslog.listenAddr.udp=:3001,:3002,:3005",
+		`-syslog.streamFields.udp='','["msg_1","msg_2"]',''`,
+		`-syslog.ignoreFields.udp='["ignore_1"]','',''`,
+	}
+	f(&spec, expected)
+
+	// mixed udp and tcp
+	// multiple udp listeners
+	spec = vmv1.SyslogServerSpec{
+		TCPListeners: []*vmv1.SyslogTCPListener{
+			{
+				ListenPort: 3001,
+			},
+			{
+				ListenPort:   3002,
+				StreamFields: vmv1.FieldsListString(`["msg_1","msg_2"]`),
+			},
+		},
+		UDPListeners: []*vmv1.SyslogUDPListener{
+			{
+				ListenPort:   3001,
+				IgnoreFields: vmv1.FieldsListString(`["ignore_1"]`),
+			},
+			{
+				ListenPort:   3002,
+				StreamFields: vmv1.FieldsListString(`["msg_1","msg_2"]`),
+			},
+			{
+				ListenPort: 3005,
+			},
+		},
+	}
+	expected = []string{
+		"-syslog.listenAddr.tcp=:3001,:3002",
+		`-syslog.streamFields.tcp='','["msg_1","msg_2"]'`,
+		"-syslog.listenAddr.udp=:3001,:3002,:3005",
+		`-syslog.streamFields.udp='','["msg_1","msg_2"]',''`,
+		`-syslog.ignoreFields.udp='["ignore_1"]','',''`,
+	}
+	f(&spec, expected)
+
+	// with tls
+	spec = vmv1.SyslogServerSpec{
+		TCPListeners: []*vmv1.SyslogTCPListener{
+			{
+				ListenPort: 3001,
+				TenantID:   "10:25",
+			},
+			{
+				ListenPort:   3002,
+				StreamFields: vmv1.FieldsListString(`["msg_1","msg_2"]`),
+				TLSConfig: &vmv1.TLSServerConfig{
+					CertSecret: &corev1.SecretKeySelector{
+						Key: "CERT",
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "tls",
+						},
+					},
+					KeyFile:      "/etc/vm/secrets/tls/key",
+					MinVersion:   "TLS12",
+					CipherSuites: []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"},
+				},
+			},
+		},
+		UDPListeners: []*vmv1.SyslogUDPListener{
+			{
+				ListenPort:     3001,
+				CompressMethod: "zstd",
+			},
+		},
+	}
+	expected = []string{
+		"-syslog.listenAddr.tcp=:3001,:3002",
+		`-syslog.streamFields.tcp='','["msg_1","msg_2"]'`,
+		`-syslog.tenantID.tcp=10:25,`,
+		"-syslog.tls=,true",
+		"-syslog.tlsCertFile=,/etc/vm/tls-server-secrets/tls/CERT",
+		"-syslog.tlsKeyFile=,/etc/vm/secrets/tls/key",
+		"-syslog.tlsCipherSuites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_AES_128_GCM_SHA256",
+		"-syslog.tlsMinVersion=TLS12",
+		"-syslog.listenAddr.udp=:3001",
+		"-syslog.compressMethod.udp=zstd",
+	}
+	f(&spec, expected)
+
+	spec = vmv1.SyslogServerSpec{
+		TCPListeners: []*vmv1.SyslogTCPListener{
+			{
+				ListenPort: 3001,
+				TLSConfig: &vmv1.TLSServerConfig{
+					CertFile:     "/etc/vm/secrets/tls/cert",
+					KeyFile:      "/etc/vm/secrets/tls/key",
+					MinVersion:   "TLS12",
+					CipherSuites: []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"},
+				},
+			},
+			{
+				ListenPort: 3002,
+				TLSConfig: &vmv1.TLSServerConfig{
+					CertFile:     "/etc/vm/secrets/tls/cert2",
+					KeyFile:      "/etc/vm/secrets/tls/key2",
+					MinVersion:   "TLS12",
+					CipherSuites: []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"},
+				},
+			},
+		},
+	}
+	expected = []string{
+		"-syslog.listenAddr.tcp=:3001,:3002",
+		"-syslog.tls=true,true",
+		"-syslog.tlsCertFile=/etc/vm/secrets/tls/cert,/etc/vm/secrets/tls/cert2",
+		"-syslog.tlsKeyFile=/etc/vm/secrets/tls/key,/etc/vm/secrets/tls/key2",
+		"-syslog.tlsCipherSuites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_AES_128_GCM_SHA256",
+		"-syslog.tlsMinVersion=TLS12",
+	}
+	f(&spec, expected)
+}
+
+func TestAddOTLPGRPCArgsTo(t *testing.T) {
+	f := func(grpcSpec *vmv1.OTLPGRPCSpec, wantArgs []string) {
+		t.Helper()
+		args := AddOTLPGRPCArgsTo(nil, grpcSpec, "/etc/vt/tls-server-secrets")
+		assert.Equal(t, wantArgs, args)
+	}
+	f(nil, nil)
+
+	// no tls
+	f(&vmv1.OTLPGRPCSpec{ListenPort: 4317}, []string{
+		"-otlpGRPCListenAddr=:4317",
+		"-otlpGRPC.tls=false",
+	})
+
+	// with tls, cert/key from files
+	f(&vmv1.OTLPGRPCSpec{
+		ListenPort: 4317,
+		TLSConfig: &vmv1.TLSServerConfig{
+			CertFile: "/etc/certs/tls.crt",
+			KeyFile:  "/etc/certs/tls.key",
+		},
+	}, []string{
+		"-otlpGRPCListenAddr=:4317",
+		"-otlpGRPC.tls=true",
+		"-otlpGRPC.tlsCertFile=/etc/certs/tls.crt",
+		"-otlpGRPC.tlsKeyFile=/etc/certs/tls.key",
+	})
+
+	// with tls, cert/key from secrets, minVersion and cipherSuites
+	f(&vmv1.OTLPGRPCSpec{
+		ListenPort: 4317,
+		TLSConfig: &vmv1.TLSServerConfig{
+			CertSecret: &corev1.SecretKeySelector{
+				Key:                  "CERT",
+				LocalObjectReference: corev1.LocalObjectReference{Name: "tls"},
+			},
+			KeySecret: &corev1.SecretKeySelector{
+				Key:                  "KEY",
+				LocalObjectReference: corev1.LocalObjectReference{Name: "tls"},
+			},
+			MinVersion:   "TLS13",
+			CipherSuites: []string{"TLS_AES_128_GCM_SHA256"},
+		},
+	}, []string{
+		"-otlpGRPCListenAddr=:4317",
+		"-otlpGRPC.tls=true",
+		"-otlpGRPC.tlsCertFile=/etc/vt/tls-server-secrets/tls/CERT",
+		"-otlpGRPC.tlsKeyFile=/etc/vt/tls-server-secrets/tls/KEY",
+		"-otlpGRPC.tlsMinVersion=TLS13",
+		"-otlpGRPC.tlsCipherSuites=TLS_AES_128_GCM_SHA256",
+	})
+}
+
+func TestAddOTLPGRPCPortTo(t *testing.T) {
+	assert.Nil(t, AddOTLPGRPCPortTo(nil, nil))
+	ports := AddOTLPGRPCPortTo(nil, &vmv1.OTLPGRPCSpec{ListenPort: 4317})
+	assert.Equal(t, []corev1.ContainerPort{
+		{Name: "otlp-grpc", Protocol: corev1.ProtocolTCP, ContainerPort: 4317},
+	}, ports)
+}
+
+func TestAddOTLPGRPCTLSConfigToVolumes(t *testing.T) {
+	volumes, mounts := AddOTLPGRPCTLSConfigToVolumes(nil, nil, nil, "/etc/vt/tls-server-secrets")
+	assert.Nil(t, volumes)
+	assert.Nil(t, mounts)
+
+	grpcSpec := &vmv1.OTLPGRPCSpec{
+		ListenPort: 4317,
+		TLSConfig: &vmv1.TLSServerConfig{
+			CertSecret: &corev1.SecretKeySelector{
+				Key:                  "CERT",
+				LocalObjectReference: corev1.LocalObjectReference{Name: "tls"},
+			},
+			KeySecret: &corev1.SecretKeySelector{
+				Key:                  "KEY",
+				LocalObjectReference: corev1.LocalObjectReference{Name: "tls"},
+			},
+		},
+	}
+	volumes, mounts = AddOTLPGRPCTLSConfigToVolumes(nil, nil, grpcSpec, "/etc/vt/tls-server-secrets")
+	require.Len(t, volumes, 1)
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "secret-tls-tls", volumes[0].Name)
+	assert.Equal(t, "tls", volumes[0].Secret.SecretName)
+	assert.Equal(t, "secret-tls-tls", mounts[0].Name)
+	assert.Equal(t, "/etc/vt/tls-server-secrets/tls", mounts[0].MountPath)
+}
+
+func TestStorageVolumeMountsTo(t *testing.T) {
+	type opts struct {
+		pvcSrc          *corev1.PersistentVolumeClaimVolumeSource
+		storagePath     string
+		volumes         []corev1.Volume
+		expectedVolumes []corev1.Volume
+		mounts          []corev1.VolumeMount
+		expectedMounts  []corev1.VolumeMount
+		wantErr         bool
+		isStatefulSet   bool
+	}
+	f := func(o opts) {
+		t.Helper()
+		gotVolumes, gotMounts, err := StorageVolumeMountsTo(o.volumes, o.mounts, o.pvcSrc, o.storagePath, DataVolumeName, o.isStatefulSet)
+		assert.Equal(t, o.expectedMounts, gotMounts)
+		assert.Equal(t, o.expectedVolumes, gotVolumes)
+		if o.wantErr {
+			assert.Error(t, err)
+		} else {
+			assert.NoError(t, err)
+		}
+	}
+
+	// no PVC spec and no volumes and mounts
+	f(opts{
+		storagePath: "/test",
+		expectedVolumes: []corev1.Volume{{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		}},
+		expectedMounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+	})
+
+	// with PVC spec and no volumes and mounts
+	f(opts{
+		storagePath: "/test",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+		expectedVolumes: []corev1.Volume{{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "test-claim",
+				},
+			},
+		}},
+		expectedMounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+	})
+
+	// with PVC spec and matching data volume
+	f(opts{
+		volumes: []corev1.Volume{{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+					VolumeID: "aws-volume",
+				},
+			},
+		}},
+		storagePath: "/test",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+		wantErr: true,
+	})
+
+	// with PVC spec and not matching data volume
+	f(opts{
+		volumes: []corev1.Volume{{
+			Name: "extra",
+			VolumeSource: corev1.VolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+					VolumeID: "aws-volume",
+				},
+			},
+		}},
+		storagePath: "/test",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+		expectedVolumes: []corev1.Volume{
+			{
+				Name: DataVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: "test-claim",
+					},
+				},
+			},
+			{
+				Name: "extra",
+				VolumeSource: corev1.VolumeSource{
+					AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+						VolumeID: "aws-volume",
+					},
+				},
+			},
+		},
+		expectedMounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+	})
+
+	// with PVC spec and existing data volume mount
+	f(opts{
+		volumes: []corev1.Volume{{
+			Name: "extra",
+			VolumeSource: corev1.VolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+					VolumeID: "aws-volume",
+				},
+			},
+		}},
+		mounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/other-path",
+		}},
+		wantErr:     true,
+		storagePath: "/test",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+	})
+
+	// with PVC spec and intersecting data volume mount
+	f(opts{
+		volumes: []corev1.Volume{{
+			Name: "extra",
+			VolumeSource: corev1.VolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+					VolumeID: "aws-volume",
+				},
+			},
+		}},
+		mounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+		storagePath: "/test/data",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+		expectedVolumes: []corev1.Volume{
+			{
+				Name: DataVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: "test-claim",
+					},
+				},
+			},
+			{
+				Name: "extra",
+				VolumeSource: corev1.VolumeSource{
+					AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+						VolumeID: "aws-volume",
+					},
+				},
+			},
+		},
+		expectedMounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+	})
+
+	// with PVC spec and intersecting volume mount and absent volume
+	f(opts{
+		volumes: []corev1.Volume{{
+			Name: "test",
+			VolumeSource: corev1.VolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+					VolumeID: "aws-volume",
+				},
+			},
+		}},
+		mounts: []corev1.VolumeMount{{
+			Name:      "test",
+			MountPath: "/test",
+		}},
+		storagePath: "/test/data",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+		wantErr: true,
+	})
+
+	// isStatefulSet, add data volume
+	f(opts{
+		isStatefulSet:   true,
+		storagePath:     "/test",
+		expectedVolumes: nil,
+		expectedMounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+	})
+
+	// isStatefulSet, mount PVC
+	f(opts{
+		isStatefulSet: true,
+		volumes: []corev1.Volume{{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "test-claim",
+				},
+			},
+		}},
+		storagePath: "/test",
+		expectedVolumes: []corev1.Volume{{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "test-claim",
+				},
+			},
+		}},
+		expectedMounts: []corev1.VolumeMount{{
+			Name:      DataVolumeName,
+			MountPath: "/test",
+		}},
+	})
+
+	// isStatefulSet, existing volume + pvcSrc — error
+	f(opts{
+		isStatefulSet: true,
+		volumes: []corev1.Volume{{
+			Name: DataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{
+					VolumeID: "aws-volume",
+				},
+			},
+		}},
+		storagePath: "/test",
+		pvcSrc: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "test-claim",
+		},
+		wantErr: true,
+	})
+}
+
+func TestBuildConfigReloaderContainer(t *testing.T) {
+	type opts struct {
+		cr                *vmv1beta1.VMAlert
+		cmNames           []string
+		expectedContainer corev1.Container
+		cfgMutator        func(*config.BaseOperatorConf)
+	}
+	f := func(o opts) {
+		t.Helper()
+		cfg := config.MustGetBaseConfig()
+		if o.cfgMutator != nil {
+			defaultCfg := *cfg
+			o.cfgMutator(cfg)
+			defer func() {
+				*config.MustGetBaseConfig() = defaultCfg
+			}()
+		}
+		var extraMounts []corev1.VolumeMount
+		for _, cm := range o.cr.Spec.ConfigMaps {
+			extraMounts = append(extraMounts, corev1.VolumeMount{
+				Name:      k8stools.SanitizeVolumeName("configmap-" + cm),
+				ReadOnly:  true,
+				MountPath: path.Join(vmv1beta1.ConfigMapsDir, cm),
+			})
+		}
+		for _, cm := range o.cmNames {
+			extraMounts = append(extraMounts, corev1.VolumeMount{
+				Name:      cm,
+				MountPath: path.Join("/cm-dir", cm),
+			})
+		}
+		got := ConfigReloaderContainer(ConfigReloaderOpts{
+			CR:     o.cr,
+			Mounts: extraMounts,
+		})
+		assert.Equal(t, o.expectedContainer, got)
+	}
+
+	// base case
+	f(opts{
+		cr: &vmv1beta1.VMAlert{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "base",
+			},
+			Spec: vmv1beta1.VMAlertSpec{
+				CommonAppsParams: vmv1beta1.CommonAppsParams{
+					ExtraArgs: map[string]string{
+						"reloadAuthKey": "test",
+					},
+				},
+			},
+		},
+		cmNames: []string{"cm-0", "cm-1"},
+		cfgMutator: func(c *config.BaseOperatorConf) {
+			c.EnableTCP6 = true
+		},
+		expectedContainer: corev1.Container{
+			Name: "config-reloader",
+			Args: []string{
+				"--enableTCP6",
+				"--reload-url=http://localhost:/-/reload?authKey=test",
+				"--webhook-method=POST",
+				"--watched-dir=/cm-dir/cm-0",
+				"--target-dir=",
+				"--watched-dir=/cm-dir/cm-1",
+				"--target-dir=",
+			},
+			Ports: []corev1.ContainerPort{{
+				Name:          "reloader-http",
+				ContainerPort: 8435,
+				Protocol:      "TCP",
+			}},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/health",
+						Port:   intstr.FromInt32(8435),
+						Scheme: "HTTP",
+					},
+				},
+				TimeoutSeconds:   1,
+				PeriodSeconds:    10,
+				SuccessThreshold: 1,
+				FailureThreshold: 3,
+			},
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/health",
+						Port:   intstr.FromInt32(8435),
+						Scheme: "HTTP",
+					},
+				},
+				InitialDelaySeconds: 5,
+				TimeoutSeconds:      1,
+				PeriodSeconds:       10,
+				SuccessThreshold:    1,
+				FailureThreshold:    3,
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "cm-0",
+					MountPath: "/cm-dir/cm-0",
+				},
+				{
+					Name:      "cm-1",
+					MountPath: "/cm-dir/cm-1",
+				},
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+		},
+	})
+
+	// vm config-reloader
+	f(opts{
+		cr: &vmv1beta1.VMAlert{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "base",
+			},
+		},
+		cmNames: []string{"cm-0"},
+		expectedContainer: corev1.Container{
+			Name: "config-reloader",
+			Args: []string{
+				"--reload-url=http://127.0.0.1:/-/reload",
+				"--webhook-method=POST",
+				"--watched-dir=/cm-dir/cm-0",
+				"--target-dir=",
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "cm-0",
+					MountPath: "/cm-dir/cm-0",
+				},
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "reloader-http",
+					Protocol:      corev1.ProtocolTCP,
+					ContainerPort: 8435,
+				},
+			},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/health",
+						Port:   intstr.FromInt32(8435),
+						Scheme: "HTTP",
+					},
+				},
+				TimeoutSeconds:   1,
+				PeriodSeconds:    10,
+				SuccessThreshold: 1,
+				FailureThreshold: 3,
+			},
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/health",
+						Port:   intstr.FromInt32(8435),
+						Scheme: "HTTP",
+					},
+				},
+				InitialDelaySeconds: 5,
+				TimeoutSeconds:      1,
+				PeriodSeconds:       10,
+				SuccessThreshold:    1,
+				FailureThreshold:    3,
+			},
+		},
+	})
+
+	// extra volumes
+	f(opts{
+		cr: &vmv1beta1.VMAlert{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "base",
+			},
+			Spec: vmv1beta1.VMAlertSpec{
+				CommonAppsParams: vmv1beta1.CommonAppsParams{
+					ConfigMaps: []string{"extra-template-1", "extra-template-2"},
+				},
+			},
+		},
+		cmNames: []string{"cm-0"},
+		expectedContainer: corev1.Container{
+			Name: "config-reloader",
+			Args: []string{
+				"--reload-url=http://127.0.0.1:/-/reload",
+				"--webhook-method=POST",
+				"--watched-dir=/cm-dir/cm-0",
+				"--target-dir=",
+				"--watched-dir=/etc/vm/configs/extra-template-1",
+				"--target-dir=",
+				"--watched-dir=/etc/vm/configs/extra-template-2",
+				"--target-dir=",
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "cm-0",
+					MountPath: "/cm-dir/cm-0",
+				},
+				{
+					Name:      "configmap-extra-template-1",
+					ReadOnly:  true,
+					MountPath: "/etc/vm/configs/extra-template-1",
+				},
+				{
+					Name:      "configmap-extra-template-2",
+					ReadOnly:  true,
+					MountPath: "/etc/vm/configs/extra-template-2",
+				},
+			},
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "reloader-http",
+					Protocol:      corev1.ProtocolTCP,
+					ContainerPort: 8435,
+				},
+			},
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/health",
+						Port:   intstr.FromInt32(8435),
+						Scheme: "HTTP",
+					},
+				},
+				TimeoutSeconds:   1,
+				PeriodSeconds:    10,
+				SuccessThreshold: 1,
+				FailureThreshold: 3,
+			},
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path:   "/health",
+						Port:   intstr.FromInt32(8435),
+						Scheme: "HTTP",
+					},
+				},
+				InitialDelaySeconds: 5,
+				TimeoutSeconds:      1,
+				PeriodSeconds:       10,
+				SuccessThreshold:    1,
+				FailureThreshold:    3,
+			},
+		},
+	})
+}
+
+func TestConfigReloaderWatchTargetPairing(t *testing.T) {
+	type watchTarget struct {
+		mountPath string
+		targetDir string
+	}
+	type opts struct {
+		cr     reloadable
+		mounts []corev1.VolumeMount
+		// extraDirs are added with AddWatchTargetDir after the container is built, like vmalert
+		// rule buckets and vmagent overflow scrape config secrets
+		extraDirs    []watchTarget
+		expectedArgs []string
+	}
+	f := func(o opts) {
+		t.Helper()
+		got := ConfigReloaderContainer(ConfigReloaderOpts{
+			CR:     o.cr,
+			Mounts: o.mounts,
+		})
+		for _, d := range o.extraDirs {
+			AddWatchTargetDir(&got, corev1.VolumeMount{
+				Name:      path.Base(d.mountPath),
+				MountPath: d.mountPath,
+				ReadOnly:  true,
+			}, d.targetDir)
+		}
+		assert.Equal(t, o.expectedArgs, got.Args)
+	}
+
+	f(opts{
+		cr: &vmv1beta1.VMAgent{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pairing"},
+		},
+		mounts: []corev1.VolumeMount{
+			{Name: "config-out", MountPath: "/etc/vmagent/config_out"},
+			{Name: "configmap-tpl", MountPath: "/etc/vm/configs/tpl"},
+			{Name: "stream-aggr-conf", MountPath: "/etc/vm/stream-aggr"},
+			{Name: "relabeling-assets", MountPath: "/etc/vm/relabeling"},
+		},
+		extraDirs: []watchTarget{
+			{mountPath: "/etc/vm/sc-raw-1", targetDir: "/etc/vm/sc-files/sc-raw-1"},
+			{mountPath: "/etc/vm/sc-raw-2", targetDir: "/etc/vm/sc-files/sc-raw-2"},
+		},
+		expectedArgs: []string{
+			"--reload-url=http://127.0.0.1:/-/reload",
+			"--webhook-method=POST",
+			"--watched-dir=/etc/vm/configs/tpl",
+			"--target-dir=",
+			"--watched-dir=/etc/vm/relabeling",
+			"--target-dir=",
+			"--watched-dir=/etc/vm/stream-aggr",
+			"--target-dir=",
+			"--watched-dir=/etc/vm/sc-raw-1",
+			"--target-dir=/etc/vm/sc-files/sc-raw-1",
+			"--watched-dir=/etc/vm/sc-raw-2",
+			"--target-dir=/etc/vm/sc-files/sc-raw-2",
+		},
+	})
+
+	f(opts{
+		cr: &vmv1beta1.VMAgent{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pairing"},
+			Spec: vmv1beta1.VMAgentSpec{
+				CommonConfigReloaderParams: vmv1beta1.CommonConfigReloaderParams{
+					ConfigReloaderExtraArgs: map[string]string{
+						"watched-dir":     "/opt/extra",
+						"target-dir":      "/opt/extra-out",
+						"rules-dir":       "/opt/extra-rules",
+						"resync-interval": "30s",
+					},
+				},
+			},
+		},
+		mounts: []corev1.VolumeMount{
+			{Name: "configmap-tpl", MountPath: "/etc/vm/configs/tpl"},
+		},
+		extraDirs: []watchTarget{
+			{mountPath: "/etc/vmalert/rules-src-0", targetDir: "/etc/vmalert/rules-out/rules-src-0"},
+		},
+		expectedArgs: []string{
+			"--reload-url=http://127.0.0.1:/-/reload",
+			"--resync-interval=30s",
+			"--webhook-method=POST",
+			"--watched-dir=/etc/vm/configs/tpl",
+			"--target-dir=",
+			"--watched-dir=/etc/vmalert/rules-src-0",
+			"--target-dir=/etc/vmalert/rules-out/rules-src-0",
+		},
+	})
+}
+
+func TestProbeRendersDeclaredLiveness(t *testing.T) {
+	// A user-declared livenessProbe must render even for CRDs that do not
+	// add a default liveness probe (VMSingle and friends — PR #204 wired
+	// spec.livenessProbe for VMSingle, the centralized probe building
+	// silently dropped it for types with ProbeNeedLiveness()=false).
+	run := func(cr probeCRD, params *vmv1beta1.CommonAppsParams) corev1.Container {
+		t.Helper()
+		var c corev1.Container
+		Probe(&c, cr, params)
+		return c
+	}
+
+	single := &vmv1beta1.VMSingle{}
+	single.Spec.LivenessProbe = &corev1.Probe{PeriodSeconds: 11}
+
+	c := run(single, &single.Spec.CommonAppsParams)
+	assert.NotNil(t, c.LivenessProbe, "declared livenessProbe must render for VMSingle")
+	assert.Equal(t, int32(11), c.LivenessProbe.PeriodSeconds)
+	assert.NotNil(t, c.LivenessProbe.HTTPGet, "missing handler is filled from probe defaults")
+	assert.NotNil(t, c.ReadinessProbe)
+
+	bare := &vmv1beta1.VMSingle{}
+	c = run(bare, &bare.Spec.CommonAppsParams)
+	assert.Nil(t, c.LivenessProbe, "no default liveness probe appears when nothing is declared")
+
+	agent := &vmv1beta1.VMAgent{}
+	agent.Spec.LivenessProbe = &corev1.Probe{PeriodSeconds: 13}
+	c = run(agent, &agent.Spec.CommonAppsParams)
+	assert.NotNil(t, c.LivenessProbe)
+	assert.Equal(t, int32(13), c.LivenessProbe.PeriodSeconds)
+
+	bareAgent := &vmv1beta1.VMAgent{}
+	c = run(bareAgent, &bareAgent.Spec.CommonAppsParams)
+	assert.NotNil(t, c.LivenessProbe, "default liveness probe still added for types that opt in")
+}

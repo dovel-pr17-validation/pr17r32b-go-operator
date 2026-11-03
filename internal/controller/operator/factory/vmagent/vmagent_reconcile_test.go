@@ -1,0 +1,807 @@
+package vmagent
+
+import (
+	"context"
+	"testing"
+	"testing/synctest"
+
+	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	rbacv1 "k8s.io/api/rbac/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	vpav1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	vmv1beta1 "github.com/VictoriaMetrics/operator/api/operator/v1beta1"
+	"github.com/VictoriaMetrics/operator/internal/config"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/build"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/k8stools"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/reconcile"
+)
+
+func TestDeleteOrphaned_UsesReconcilerConfig(t *testing.T) {
+	ctx := context.Background()
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vmagent", Namespace: "agent-ns"},
+		Spec:       vmv1beta1.VMAgentSpec{ServiceAccountName: "external"},
+	}
+	rbacName := cr.GetRBACName()
+	owner := cr.AsOwner()
+	foreignNamespace := "other-reconciler-ns"
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{
+		cr,
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: cr.Namespace, OwnerReferences: []metav1.OwnerReference{owner}}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: cr.Namespace, OwnerReferences: []metav1.OwnerReference{owner}}},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: foreignNamespace, OwnerReferences: []metav1.OwnerReference{owner}}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: rbacName, Namespace: foreignNamespace, OwnerReferences: []metav1.OwnerReference{owner}}},
+		&vpav1.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: cr.PrefixedName(), Namespace: cr.Namespace, OwnerReferences: []metav1.OwnerReference{owner}}},
+	})
+
+	assert.NoError(t, deleteOrphaned(ctx, fclient, cr, &config.BaseOperatorConf{WatchNamespaces: []string{cr.Namespace}, VPAAPIEnabled: true}))
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		err := fclient.Get(ctx, types.NamespacedName{Name: rbacName, Namespace: cr.Namespace}, obj)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+		assert.NoError(t, fclient.Get(ctx, types.NamespacedName{Name: rbacName, Namespace: foreignNamespace}, obj))
+	}
+	assert.True(t, k8serrors.IsNotFound(fclient.Get(ctx, types.NamespacedName{Name: cr.PrefixedName(), Namespace: cr.Namespace}, &vpav1.VerticalPodAutoscaler{})))
+}
+
+// In namespaced mode a Role and RoleBinding are created at every watched namespace,
+// so that service discovery works there, see createK8sAPIAccess.
+// Setting spec.serviceAccountName makes all of them unnecessary, but the ones outside
+// cr.Namespace cannot reference cr as their owner, so deleteOrphaned has to delete
+// them instead of relying on garbage collection.
+func TestDeleteOrphaned_RemovesCrossNamespaceRBAC(t *testing.T) {
+	ctx := context.Background()
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vmagent", Namespace: "agent-ns"},
+		// an externally managed ServiceAccount, operator owned RBAC is no longer needed
+		Spec: vmv1beta1.VMAgentSpec{ServiceAccountName: "external"},
+	}
+	watchedNamespace := "watched-ns"
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{
+		cr,
+		buildRole(cr, cr.Namespace), buildRB(cr, cr.Namespace),
+		buildRole(cr, watchedNamespace), buildRB(cr, watchedNamespace),
+	})
+
+	cfg := &config.BaseOperatorConf{WatchNamespaces: []string{cr.Namespace, watchedNamespace}}
+	assert.NoError(t, deleteOrphaned(ctx, fclient, cr, cfg))
+	for _, ns := range cfg.WatchNamespaces {
+		for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+			err := fclient.Get(ctx, types.NamespacedName{Name: cr.GetRBACName(), Namespace: ns}, obj)
+			assert.True(t, k8serrors.IsNotFound(err), "%T at %s must be removed, got %v", obj, ns, err)
+		}
+	}
+}
+
+// In cluster-wide mode a Role and RoleBinding are still created at cr.Namespace,
+// to keep the secrets access namespace-scoped, see createK8sAPIAccess.
+// Setting spec.serviceAccountName makes them unnecessary, but cr itself stays alive,
+// so deleteOrphaned has to delete them instead of relying on garbage collection.
+func TestDeleteOrphaned_RemovesClusterWideRBAC(t *testing.T) {
+	ctx := context.Background()
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vmagent", Namespace: "agent-ns"},
+		Spec:       vmv1beta1.VMAgentSpec{ServiceAccountName: "external"},
+	}
+	rbacName := cr.GetRBACName()
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{
+		cr,
+		buildRole(cr, cr.Namespace), buildRB(cr, cr.Namespace),
+		buildCR(cr), buildCRB(cr),
+	})
+
+	assert.NoError(t, deleteOrphaned(ctx, fclient, cr, &config.BaseOperatorConf{}))
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		err := fclient.Get(ctx, types.NamespacedName{Name: rbacName, Namespace: cr.Namespace}, obj)
+		assert.True(t, k8serrors.IsNotFound(err), "%T at %s must be removed, got %v", obj, cr.Namespace, err)
+	}
+	for _, obj := range []client.Object{&rbacv1.ClusterRole{}, &rbacv1.ClusterRoleBinding{}} {
+		err := fclient.Get(ctx, types.NamespacedName{Name: rbacName}, obj)
+		assert.True(t, k8serrors.IsNotFound(err), "%T must be removed, got %v", obj, err)
+	}
+}
+
+func Test_CreateOrUpdate_Actions(t *testing.T) {
+	type args struct {
+		cr     *vmv1beta1.VMAgent
+		preRun func(ctx context.Context, c *k8stools.ClientWithActions, cr *vmv1beta1.VMAgent)
+	}
+	type want struct {
+		actions []k8stools.ClientAction
+		err     error
+	}
+
+	vmagentName := types.NamespacedName{Namespace: "default", Name: "vmagent-vmagent"}
+	vmagentUnprefixedName := types.NamespacedName{Namespace: "default", Name: "vmagent"}
+	clusterRoleName := types.NamespacedName{Name: "monitoring:default:vmagent-vmagent"}
+	roleName := types.NamespacedName{Namespace: "default", Name: "monitoring:default:vmagent-vmagent"}
+	tlsAssetsName := types.NamespacedName{Namespace: "default", Name: "tls-assets-vmagent-vmagent"}
+
+	defaultCR := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmagent",
+			Namespace: "default",
+			UID:       "123",
+		},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{
+				{URL: "http://remote-write"},
+			},
+			CommonAppsParams: vmv1beta1.CommonAppsParams{
+				ReplicaCount: ptr.To(int32(1)),
+			},
+		},
+		Status: vmv1beta1.VMAgentStatus{
+			LastAppliedSpec: &vmv1beta1.VMAgentSpec{
+				RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{
+					{URL: "http://remote-write"},
+				},
+				CommonAppsParams: vmv1beta1.CommonAppsParams{
+					ReplicaCount: ptr.To(int32(1)),
+				},
+			},
+		},
+	}
+
+	crWithoutStatus := defaultCR.DeepCopy()
+	crWithoutStatus.Status = vmv1beta1.VMAgentStatus{}
+
+	setupReadyVMAgent := func(ctx context.Context, c *k8stools.ClientWithActions, cr *vmv1beta1.VMAgent) {
+		// Create objects first
+		assert.NoError(t, CreateOrUpdate(ctx, cr, c))
+		// clear actions
+		c.Actions = nil
+	}
+
+	f := func(args args, want want) {
+		t.Helper()
+		fclient := k8stools.GetTestClientWithActionsAndObjects(nil)
+		ctx := context.TODO()
+		build.AddDefaults(fclient.Scheme())
+		fclient.Scheme().Default(args.cr)
+
+		if args.preRun != nil {
+			args.preRun(ctx, fclient, args.cr)
+		}
+
+		synctest.Test(t, func(t *testing.T) {
+			err := CreateOrUpdate(ctx, args.cr, fclient)
+			if want.err != nil {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			if !assert.Equal(t, len(want.actions), len(fclient.Actions)) {
+				for i, action := range fclient.Actions {
+					t.Logf("Action %d: %s %s %s", i, action.Verb, action.Kind, action.Resource)
+				}
+			}
+
+			for i, action := range want.actions {
+				if i >= len(fclient.Actions) {
+					break
+				}
+				assert.Equal(t, action.Verb, fclient.Actions[i].Verb, "idx %d verb", i)
+				assert.Equal(t, action.Kind, fclient.Actions[i].Kind, "idx %d kind", i)
+				assert.Equal(t, action.Resource, fclient.Actions[i].Resource, "idx %d resource", i)
+			}
+		})
+	}
+
+	// create vmagent with default config (Deployment mode)
+	f(args{
+		cr: &vmv1beta1.VMAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vmagent",
+				Namespace: "default",
+			},
+			Spec: vmv1beta1.VMAgentSpec{
+				RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{
+					{URL: "http://remote-write"},
+				},
+			},
+		},
+	},
+		want{
+			actions: []k8stools.ClientAction{
+				{Verb: "Get", Kind: "ServiceAccount", Resource: vmagentName},
+				{Verb: "Create", Kind: "ServiceAccount", Resource: vmagentName},
+				{Verb: "Get", Kind: "ClusterRole", Resource: clusterRoleName},
+				{Verb: "Create", Kind: "ClusterRole", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "ClusterRoleBinding", Resource: clusterRoleName},
+				{Verb: "Create", Kind: "ClusterRoleBinding", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "Role", Resource: roleName},
+				{Verb: "Create", Kind: "Role", Resource: roleName},
+				{Verb: "Get", Kind: "RoleBinding", Resource: roleName},
+				{Verb: "Create", Kind: "RoleBinding", Resource: roleName},
+				{Verb: "Get", Kind: "Service", Resource: vmagentName},
+				{Verb: "Create", Kind: "Service", Resource: vmagentName},
+				{Verb: "Get", Kind: "VMServiceScrape", Resource: vmagentName},
+				{Verb: "Create", Kind: "VMServiceScrape", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: vmagentName},
+				{Verb: "Create", Kind: "Secret", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: tlsAssetsName},
+				{Verb: "Create", Kind: "Secret", Resource: tlsAssetsName},
+				{Verb: "Get", Kind: "Deployment", Resource: vmagentName},
+				{Verb: "Create", Kind: "Deployment", Resource: vmagentName},
+				{Verb: "Get", Kind: "Deployment", Resource: vmagentName},
+			},
+		})
+
+	// update vmagent (Deployment mode)
+	f(args{
+		cr:     crWithoutStatus,
+		preRun: setupReadyVMAgent,
+	},
+		want{
+			actions: []k8stools.ClientAction{
+				{Verb: "Get", Kind: "ServiceAccount", Resource: vmagentName},
+				{Verb: "Get", Kind: "ClusterRole", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "ClusterRoleBinding", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "Role", Resource: roleName},
+				{Verb: "Get", Kind: "RoleBinding", Resource: roleName},
+				{Verb: "Get", Kind: "Service", Resource: vmagentName},
+				{Verb: "Get", Kind: "VMServiceScrape", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: tlsAssetsName},
+				{Verb: "Get", Kind: "Deployment", Resource: vmagentName},
+				{Verb: "Get", Kind: "Deployment", Resource: vmagentName},
+			},
+		})
+
+	// no update on status change
+	f(args{
+		cr: defaultCR.DeepCopy(),
+		preRun: func(ctx context.Context, c *k8stools.ClientWithActions, cr *vmv1beta1.VMAgent) {
+			setupReadyVMAgent(ctx, c, cr)
+			// Change status
+			cr.Status.Replicas = 1
+		},
+	},
+		want{
+			actions: []k8stools.ClientAction{
+				{Verb: "Get", Kind: "DaemonSet", Resource: vmagentName},
+				{Verb: "Get", Kind: "HorizontalPodAutoscaler", Resource: vmagentUnprefixedName},
+				{Verb: "Get", Kind: "HorizontalPodAutoscaler", Resource: vmagentName},
+				{Verb: "Get", Kind: "NetworkPolicy", Resource: vmagentName},
+				{Verb: "Get", Kind: "ServiceAccount", Resource: vmagentName},
+				{Verb: "Get", Kind: "ClusterRole", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "ClusterRoleBinding", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "Role", Resource: roleName},
+				{Verb: "Get", Kind: "RoleBinding", Resource: roleName},
+				{Verb: "Get", Kind: "Service", Resource: vmagentName},
+				{Verb: "Get", Kind: "VMServiceScrape", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: tlsAssetsName},
+				{Verb: "Get", Kind: "Deployment", Resource: vmagentName},
+				{Verb: "Get", Kind: "Deployment", Resource: vmagentName},
+			},
+		})
+
+	// daemonset mode
+	f(args{
+		cr: &vmv1beta1.VMAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vmagent",
+				Namespace: "default",
+			},
+			Spec: vmv1beta1.VMAgentSpec{
+				DaemonSetMode: true,
+				RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{
+					{URL: "http://remote-write"},
+				},
+			},
+		},
+	},
+		want{
+			actions: []k8stools.ClientAction{
+				{Verb: "Get", Kind: "ServiceAccount", Resource: vmagentName},
+				{Verb: "Create", Kind: "ServiceAccount", Resource: vmagentName},
+				{Verb: "Get", Kind: "ClusterRole", Resource: clusterRoleName},
+				{Verb: "Create", Kind: "ClusterRole", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "ClusterRoleBinding", Resource: clusterRoleName},
+				{Verb: "Create", Kind: "ClusterRoleBinding", Resource: clusterRoleName},
+				{Verb: "Get", Kind: "Role", Resource: roleName},
+				{Verb: "Create", Kind: "Role", Resource: roleName},
+				{Verb: "Get", Kind: "RoleBinding", Resource: roleName},
+				{Verb: "Create", Kind: "RoleBinding", Resource: roleName},
+				{Verb: "Get", Kind: "Service", Resource: vmagentName},
+				{Verb: "Create", Kind: "Service", Resource: vmagentName},
+				{Verb: "Get", Kind: "VMPodScrape", Resource: vmagentName},
+				{Verb: "Create", Kind: "VMPodScrape", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: vmagentName},
+				{Verb: "Create", Kind: "Secret", Resource: vmagentName},
+				{Verb: "Get", Kind: "Secret", Resource: tlsAssetsName},
+				{Verb: "Create", Kind: "Secret", Resource: tlsAssetsName},
+				{Verb: "Get", Kind: "DaemonSet", Resource: vmagentName},
+				{Verb: "Create", Kind: "DaemonSet", Resource: vmagentName},
+				{Verb: "Get", Kind: "DaemonSet", Resource: vmagentName},
+			},
+		})
+}
+
+func TestCreateOrUpdate_StatefulSetWithHPA(t *testing.T) {
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "example-vmagent",
+			Namespace: "default",
+		},
+		Spec: vmv1beta1.VMAgentSpec{
+			StatefulMode:                  true,
+			StatefulRollingUpdateStrategy: appsv1.RollingUpdateStatefulSetStrategyType,
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{
+				{URL: "http://remote-write"},
+			},
+			CommonAppsParams: vmv1beta1.CommonAppsParams{
+				ReplicaCount: ptr.To(int32(1)),
+			},
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 5,
+			},
+		},
+	}
+	stsNSN := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		// initial creation: StatefulSet created with 1 replica
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+		var sts appsv1.StatefulSet
+		assert.NoError(t, fclient.Get(ctx, stsNSN, &sts))
+		assert.Equal(t, int32(1), *sts.Spec.Replicas)
+
+		// HPA now targets the VMAgent CR scale subresource (spec.shardCount), not the StatefulSet
+		// directly. The operator must always reconcile pod replicas from spec.replicaCount.
+		cr.Spec.ReplicaCount = ptr.To(int32(2))
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+		assert.NoError(t, fclient.Get(ctx, stsNSN, &sts))
+		assert.Equal(t, int32(2), *sts.Spec.Replicas)
+	})
+}
+
+func TestCreateOrUpdateVPA_TargetsCR(t *testing.T) {
+	cfg := config.MustGetBaseConfig()
+	defaultCfg := *cfg
+	cfg.VPAAPIEnabled = true
+	defer func() { *cfg = defaultCfg }()
+
+	f := func(cr *vmv1beta1.VMAgent) {
+		t.Helper()
+		fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+		ctx := context.TODO()
+		build.AddDefaults(fclient.Scheme())
+		fclient.Scheme().Default(cr)
+
+		synctest.Test(t, func(t *testing.T) {
+			assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+			var vpa vpav1.VerticalPodAutoscaler
+			assert.NoError(t, fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}, &vpa))
+			assert.Equal(t, &autoscalingv1.CrossVersionObjectReference{
+				Name:       cr.Name,
+				Kind:       "VMAgent",
+				APIVersion: "operator.victoriametrics.com/v1beta1",
+			}, vpa.Spec.TargetRef)
+		})
+	}
+
+	// non-sharded
+	f(&vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpa-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			VPA:         &vmv1beta1.EmbeddedVPA{},
+		},
+	})
+
+	// sharded
+	f(&vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpa-vmagent-sharded", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			ShardCount:  ptr.To(int32(3)),
+			VPA:         &vmv1beta1.EmbeddedVPA{},
+		},
+	})
+}
+
+func TestCreateOrUpdateVPA_RemovedOnDisable(t *testing.T) {
+	cfg := config.MustGetBaseConfig()
+	defaultCfg := *cfg
+	cfg.VPAAPIEnabled = true
+	defer func() { *cfg = defaultCfg }()
+
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpa-disable-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			VPA:         &vmv1beta1.EmbeddedVPA{},
+		},
+	}
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		vpaNSN := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+		var vpa vpav1.VerticalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, vpaNSN, &vpa))
+
+		// deleteOrphaned only runs once cr.Status.LastAppliedSpec is set, as a real reconcile loop would
+		cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+		cr.Spec.VPA = nil
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		err := fclient.Get(ctx, vpaNSN, &vpa)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+	})
+}
+
+// regression test for https://github.com/VictoriaMetrics/operator/issues/2518
+func TestCreateOrUpdateVPA_OldNameCleanedUpOnMigration(t *testing.T) {
+	cfg := config.MustGetBaseConfig()
+	defaultCfg := *cfg
+	cfg.VPAAPIEnabled = true
+	defer func() { *cfg = defaultCfg }()
+
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpa-migrate-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			VPA:         &vmv1beta1.EmbeddedVPA{},
+		},
+	}
+	// pre-migration VPA under the old, unprefixed name
+	staleVPA := build.VPA(cr, autoscalingv1.CrossVersionObjectReference{
+		Name:       cr.Name,
+		Kind:       "VMAgent",
+		APIVersion: "operator.victoriametrics.com/v1beta1",
+	}, cr.Spec.VPA)
+	staleVPA.Name = cr.Name
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr, staleVPA})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+	cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+		var vpa vpav1.VerticalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}, &vpa))
+
+		err := fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.Name}, &vpa)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+	})
+}
+
+// regression test: with UseLegacyNaming, cr.PrefixedName() == cr.Name, so the migration
+// cleanup for the old cr.Name-named VPA must not delete the current, identically-named one.
+func TestCreateOrUpdateVPA_LegacyNamingNotChurned(t *testing.T) {
+	cfg := config.MustGetBaseConfig()
+	defaultCfg := *cfg
+	cfg.VPAAPIEnabled = true
+	defer func() { *cfg = defaultCfg }()
+
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpa-legacy-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			UseLegacyNaming: true,
+			RemoteWrite:     []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			VPA:             &vmv1beta1.EmbeddedVPA{},
+		},
+	}
+	fclient := k8stools.GetTestClientWithActionsAndObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		vpaNSN := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+		var vpa vpav1.VerticalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, vpaNSN, &vpa))
+
+		cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+		fclient.Actions = nil
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		assert.NoError(t, fclient.Get(ctx, vpaNSN, &vpa))
+		for _, action := range fclient.Actions {
+			if action.Kind == "VerticalPodAutoscaler" {
+				assert.NotEqual(t, "Delete", action.Verb, "the live VPA must not be deleted when UseLegacyNaming makes cr.PrefixedName() == cr.Name")
+			}
+		}
+	})
+}
+
+func TestCreateOrUpdateHPA_TargetsCR(t *testing.T) {
+	f := func(cr *vmv1beta1.VMAgent) {
+		t.Helper()
+		fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+		ctx := context.TODO()
+		build.AddDefaults(fclient.Scheme())
+		fclient.Scheme().Default(cr)
+
+		synctest.Test(t, func(t *testing.T) {
+			assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+			var hpa autoscalingv2.HorizontalPodAutoscaler
+			assert.NoError(t, fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}, &hpa))
+			assert.Equal(t, autoscalingv2.CrossVersionObjectReference{
+				Name:       cr.Name,
+				Kind:       "VMAgent",
+				APIVersion: "operator.victoriametrics.com/v1beta1",
+			}, hpa.Spec.ScaleTargetRef)
+		})
+	}
+
+	// non-sharded
+	f(&vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "hpa-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 3,
+			},
+		},
+	})
+
+	// sharded
+	f(&vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "hpa-vmagent-sharded", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			ShardCount:  ptr.To(int32(3)),
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 3,
+			},
+		},
+	})
+}
+
+// regression test for https://github.com/VictoriaMetrics/operator/issues/2518
+func TestCreateOrUpdateHPA_RemovedOnDisable(t *testing.T) {
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "hpa-disable-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 3,
+			},
+		},
+	}
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		hpaNSN := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+		var hpa autoscalingv2.HorizontalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, hpaNSN, &hpa))
+
+		// deleteOrphaned only runs once cr.Status.LastAppliedSpec is set, as a real reconcile loop would
+		cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+		cr.Spec.HPA = nil
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		err := fclient.Get(ctx, hpaNSN, &hpa)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+	})
+}
+
+// regression test: createOrUpdateHPA skips daemonSetMode, so an HPA left over from
+// before the switch must be removed even though spec.hpa is still set
+func TestCreateOrUpdateHPA_RemovedOnDaemonSetMode(t *testing.T) {
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "hpa-daemonset-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 3,
+			},
+		},
+	}
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		hpaNSN := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+		var hpa autoscalingv2.HorizontalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, hpaNSN, &hpa))
+
+		// deleteOrphaned only runs once cr.Status.LastAppliedSpec is set, as a real reconcile loop would
+		cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+		// spec.hpa stays set, but daemonSetMode makes it inapplicable
+		cr.Spec.DaemonSetMode = true
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		err := fclient.Get(ctx, hpaNSN, &hpa)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+	})
+}
+
+// regression test for https://github.com/VictoriaMetrics/operator/issues/2518
+func TestCreateOrUpdateHPA_OldNameCleanedUpOnMigration(t *testing.T) {
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "hpa-migrate-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 3,
+			},
+		},
+	}
+	// pre-migration HPA under the old, unprefixed name
+	staleHPA := build.HPA(cr, autoscalingv2.CrossVersionObjectReference{
+		Name:       cr.Name,
+		Kind:       "VMAgent",
+		APIVersion: "operator.victoriametrics.com/v1beta1",
+	}, cr.Spec.HPA)
+	staleHPA.Name = cr.Name
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr, staleHPA})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+	cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+		var hpa autoscalingv2.HorizontalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}, &hpa))
+
+		err := fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.Name}, &hpa)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+	})
+}
+
+// regression test: with UseLegacyNaming, cr.PrefixedName() == cr.Name, so the migration
+// cleanup for the old cr.Name-named HPA must not delete the current, identically-named one.
+func TestCreateOrUpdateHPA_LegacyNamingNotChurned(t *testing.T) {
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "hpa-legacy-vmagent", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			UseLegacyNaming: true,
+			RemoteWrite:     []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			HPA: &vmv1beta1.EmbeddedHPA{
+				MinReplicas: ptr.To(int32(1)),
+				MaxReplicas: 3,
+			},
+		},
+	}
+	fclient := k8stools.GetTestClientWithActionsAndObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		hpaNSN := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+		var hpa autoscalingv2.HorizontalPodAutoscaler
+		assert.NoError(t, fclient.Get(ctx, hpaNSN, &hpa))
+
+		cr.Status.LastAppliedSpec = cr.Spec.DeepCopy()
+		fclient.Actions = nil
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		assert.NoError(t, fclient.Get(ctx, hpaNSN, &hpa))
+		for _, action := range fclient.Actions {
+			if action.Kind == "HorizontalPodAutoscaler" {
+				assert.NotEqual(t, "Delete", action.Verb, "the live HPA must not be deleted when UseLegacyNaming makes cr.PrefixedName() == cr.Name")
+			}
+		}
+	})
+}
+
+func TestCreateOrUpdate_StatusShards(t *testing.T) {
+	f := func(cr *vmv1beta1.VMAgent, wantShards int32) {
+		t.Helper()
+		fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+		ctx := context.TODO()
+		build.AddDefaults(fclient.Scheme())
+		fclient.Scheme().Default(cr)
+
+		synctest.Test(t, func(t *testing.T) {
+			assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+			assert.NoError(t, reconcile.UpdateObjectStatus(ctx, fclient, cr, vmv1beta1.UpdateStatusOperational, nil))
+
+			var updated vmv1beta1.VMAgent
+			assert.NoError(t, fclient.Get(ctx, types.NamespacedName{Namespace: cr.Namespace, Name: cr.Name}, &updated))
+			assert.Equal(t, wantShards, updated.Status.Shards)
+		})
+	}
+
+	// non-sharded: status.shards must be 1 so VPA/HPA scale subresource is non-zero
+	f(&vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-shards", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+		},
+	}, 1)
+
+	// explicit shardCount=3
+	f(&vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "three-shards", Namespace: "default"},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{{URL: "http://remote-write"}},
+			ShardCount:  ptr.To(int32(3)),
+		},
+	}, 3)
+}
+
+func TestCreateOrUpdate_Paused(t *testing.T) {
+	cr := &vmv1beta1.VMAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "example-vmagent",
+			Namespace: "default",
+		},
+		Spec: vmv1beta1.VMAgentSpec{
+			RemoteWrite: []vmv1beta1.VMAgentRemoteWriteSpec{
+				{URL: "http://remote-write"},
+			},
+			CommonAppsParams: vmv1beta1.CommonAppsParams{
+				ReplicaCount: ptr.To(int32(1)),
+				Paused:       true,
+			},
+		},
+	}
+	nsn := types.NamespacedName{Namespace: cr.Namespace, Name: cr.PrefixedName()}
+	fclient := k8stools.GetTestClientWithObjects([]runtime.Object{cr})
+	ctx := context.TODO()
+	build.AddDefaults(fclient.Scheme())
+	fclient.Scheme().Default(cr)
+
+	synctest.Test(t, func(t *testing.T) {
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+		var dep appsv1.Deployment
+		err := fclient.Get(ctx, nsn, &dep)
+		assert.Error(t, err)
+		assert.True(t, k8serrors.IsNotFound(err))
+
+		// unpause and verify reconciliation
+		cr.Spec.Paused = false
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+		err = fclient.Get(ctx, nsn, &dep)
+		assert.NoError(t, err)
+
+		// pause and update replica count
+		cr.Spec.Paused = true
+		cr.Spec.ReplicaCount = ptr.To(int32(2))
+		assert.NoError(t, CreateOrUpdate(ctx, cr, fclient))
+
+		// check that replicas count is not updated
+		err = fclient.Get(ctx, nsn, &dep)
+		assert.NoError(t, err)
+		assert.Equal(t, int32(1), *dep.Spec.Replicas)
+	})
+}

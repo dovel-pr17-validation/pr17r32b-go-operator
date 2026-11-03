@@ -1,0 +1,133 @@
+name: Build and Test
+# This workflow will run on master branch and on any pull requests targeting master
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+      - release-*
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!**/*.md'
+      - '!**/*.yaml'
+      - '!**/*.yml'
+      - '.github/workflows/main.yaml'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      checks: write
+    outputs:
+      run_e2e: ${{ steps.changes.outputs.src }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup build environment
+        id: setup
+        uses: ./.github/actions/setup-build-env
+
+      - name: Run Trivy vulnerability scanner in repo mode
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Lint, Test and Build
+        if: github.event.pull_request.draft == false
+        run: |
+          make lint
+          make manifests
+          make api-gen
+          make docs
+          # check for uncommited changes to crds, docs or API
+          git diff --exit-code
+          make test
+
+      - name: Check rbac markers are not inert
+        if: github.event.pull_request.draft == false
+        run: ./hack/check-rbac-markers.sh
+
+      - name: Save Go cache
+        if: ${{ github.ref == 'refs/heads/master' }}
+        uses: ./.github/actions/save-go-cache
+
+      - name: Check changed files
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: changes
+        with:
+          filters: |
+            src:
+              - '**'
+              - '!Makefile'
+              - '!docs/**'
+              - '!*.md'
+              - '!.github/**'
+              - '.github/workflows/main.yaml'
+              - '!codespell/**'
+              - 'LICENSE'
+              - 'PROJECT'
+
+  e2e:
+    name: E2E / ${{ matrix.name }}
+    needs: build
+    if: github.event.pull_request.draft == false && needs.build.outputs.run_e2e == 'true'
+    runs-on: vm-runner
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: main
+            e2e_target: ./test/e2e/
+          - name: upgrade
+            e2e_target: ./test/e2e/upgrade/...
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Setup build environment
+        id: setup
+        uses: ./.github/actions/setup-build-env
+      - name: E2E Tests
+        env:
+          DOCKER_BUILD_ARGS: --cache-from=type=gha --cache-to=type=gha,mode=max
+          LICENSE_KEY: ${{ secrets.ENTERPRISE_COMPONENTS_LICENSE_KEY }}
+          E2E_TARGET: ${{ matrix.e2e_target }}
+        run: |
+          TAG=${GITHUB_SHA:0:7} BASE_REF=origin/${{ github.base_ref || 'master' }} make test-e2e
+      - name: Save Go cache
+        if: ${{ github.ref == 'refs/heads/master' }}
+        uses: ./.github/actions/save-go-cache
+      - name: Publish reports
+        uses: ./.github/actions/publish-reports

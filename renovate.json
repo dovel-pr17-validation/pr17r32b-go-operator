@@ -1,0 +1,80 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "rebaseWhen": "conflicted",
+  "packageRules": [
+    {
+      "matchDepTypes": [
+        "action"
+      ],
+      "minimumReleaseAge": "21 days"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "postUpdateOptions": [
+        "gomodTidy"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "go",
+        "golang"
+      ],
+      "groupName": "golang"
+    },
+    {
+      "matchDepNames": [
+        "github.com/onsi/ginkgo/v2"
+      ],
+      "groupName": "ginkgo"
+    },
+    {
+      "matchDepNames": [
+        "sigs.k8s.io/controller-runtime"
+      ],
+      "groupName": "controller-runtime"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "(?m)^# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)(?: versioning=(?<versioning>.*?))?(?: extractVersion=(?<extractVersion>.*?))?\\n\\w+_VERSION\\s*\\??=\\s*(?<currentValue>[v0-9].*)$"
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "(?m)^# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)(?: versioning=(?<versioning>.*?))?(?: extractVersion=(?<extractVersion>.*?))?\\nENVTEST_VERSION\\s*\\?= release-(?<currentValue>.*)$"
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^test\\/Makefile$/"
+      ],
+      "matchStrings": [
+        "(?m)^# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)(?: versioning=(?<versioning>.*?))?\\n\\w+_VERSION\\s*\\?=\\s*(?<currentValue>.*)$"
+      ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^internal\\/config\\/config\\.go$/"
+      ],
+      "matchStrings": [
+        "(?m)^\\s*// renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)(?: versioning=(?<versioning>.*?))?\\n\\s*\"\\w+\":\\s*(?:getVersion\\()?\"(?<currentValue>[^\"]+)\""
+      ]
+    }
+  ]
+}

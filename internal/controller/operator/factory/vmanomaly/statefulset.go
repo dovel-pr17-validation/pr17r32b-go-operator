@@ -1,0 +1,357 @@
+package vmanomaly
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"sync"
+
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+	vpav1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	vmv1 "github.com/VictoriaMetrics/operator/api/operator/v1"
+	vmv1beta1 "github.com/VictoriaMetrics/operator/api/operator/v1beta1"
+	"github.com/VictoriaMetrics/operator/internal/config"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/build"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/finalize"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/logger"
+	"github.com/VictoriaMetrics/operator/internal/controller/operator/factory/reconcile"
+)
+
+func buildService(cr *vmv1.VMAnomaly) *corev1.Service {
+	return build.Service(cr, cr.Spec.Server.Port, func(svc *corev1.Service) {
+		svc.Spec.ClusterIP = "None"
+		svc.Spec.PublishNotReadyAddresses = true
+	})
+}
+
+func buildScrape(cr *vmv1.VMAnomaly) *vmv1beta1.VMPodScrape {
+	if cr == nil || ptr.Deref(cr.Spec.DisableSelfServiceScrape, false) {
+		return nil
+	}
+	return build.VMPodScrape(cr, "monitoring-http")
+}
+
+// CreateOrUpdate creates vmanomaly and builds config for it
+func CreateOrUpdate(ctx context.Context, cr *vmv1.VMAnomaly, rclient client.Client) error {
+	if cr.Paused() {
+		return nil
+	}
+	var prevCR *vmv1.VMAnomaly
+	if cr.Status.LastAppliedSpec != nil {
+		prevCR = cr.DeepCopy()
+		prevCR.Spec = *cr.Status.LastAppliedSpec
+		if err := deleteOrphaned(ctx, rclient, cr); err != nil {
+			return fmt.Errorf("cannot delete orphaned resources: %w", err)
+		}
+	}
+	owner := cr.AsOwner()
+	if cr.IsOwnsServiceAccount() {
+		var prevSA *corev1.ServiceAccount
+		if prevCR != nil {
+			prevSA = build.ServiceAccount(prevCR)
+		}
+		if err := reconcile.ServiceAccount(ctx, rclient, build.ServiceAccount(cr), prevSA, &owner); err != nil {
+			return fmt.Errorf("failed create service account: %w", err)
+		}
+	}
+
+	svc := buildService(cr)
+	var prevSvc *corev1.Service
+	if prevCR != nil {
+		prevSvc = buildService(prevCR)
+	}
+	if err := reconcile.Service(ctx, rclient, svc, prevSvc, &owner); err != nil {
+		return fmt.Errorf("cannot reconcile headless service for vmanomaly: %w", err)
+	}
+
+	if !ptr.Deref(cr.Spec.DisableSelfServiceScrape, false) {
+		svs := buildScrape(cr)
+		prevSvs := buildScrape(prevCR)
+		if err := reconcile.VMPodScrape(ctx, rclient, svs, prevSvs, &owner, false); err != nil {
+			return err
+		}
+	}
+
+	cfg := config.MustGetBaseConfig()
+	if cr.Spec.VPA != nil && !cfg.VPAAPIEnabled {
+		return fmt.Errorf("spec.vpa is set but VM_VPA_API_ENABLED=true env var was not provided")
+	}
+	if err := createOrUpdateVPA(ctx, rclient, cr, prevCR); err != nil {
+		return fmt.Errorf("cannot reconcile VPA for vmanomaly: %w", err)
+	}
+
+	ac := getAssetsCache(ctx, rclient, cr)
+	if err := createOrUpdateConfig(ctx, rclient, cr, prevCR, nil, ac); err != nil {
+		return err
+	}
+
+	var prevAppTpl *appsv1.StatefulSet
+
+	if prevCR != nil {
+		var err error
+		prevAppTpl, err = newK8sApp(prevCR, ac)
+		if err != nil {
+			return fmt.Errorf("cannot build prev statefulSet for vmanomaly: %w", err)
+		}
+	}
+	newAppTpl, err := newK8sApp(cr, ac)
+	if err != nil {
+		return fmt.Errorf("cannot build new statefulSet for vmanomaly: %w", err)
+	}
+	if cr.Spec.NetworkPolicy != nil {
+		var prevNP *networkingv1.NetworkPolicy
+		if prevCR != nil && prevCR.Spec.NetworkPolicy != nil {
+			prevNP = build.NetworkPolicy(prevCR, prevCR.Spec.NetworkPolicy)
+		}
+		if err := reconcile.NetworkPolicy(ctx, rclient, build.NetworkPolicy(cr, cr.Spec.NetworkPolicy), prevNP, &owner); err != nil {
+			return fmt.Errorf("cannot update network policy for vmanomaly: %w", err)
+		}
+	}
+	return createOrUpdateApp(ctx, rclient, cr, prevCR, newAppTpl, prevAppTpl)
+}
+
+func patchShardContainers(containers []corev1.Container, shardNum, shardCount int32) {
+	for i := range containers {
+		container := &containers[i]
+		if container.Name != "vmanomaly" {
+			continue
+		}
+		// filter any env with the shard configuration name
+		envs := container.Env[:0]
+		for _, env := range container.Env {
+			if env.Name != "VMANOMALY_MEMBERS_COUNT" && env.Name != "VMANOMALY_MEMBER_NUM" {
+				envs = append(envs, env)
+			}
+		}
+		envs = append(envs, []corev1.EnvVar{
+			{
+				Name:  "VMANOMALY_MEMBERS_COUNT",
+				Value: fmt.Sprintf("%d", shardCount),
+			},
+			{
+				Name:  "VMANOMALY_MEMBER_NUM",
+				Value: fmt.Sprintf("%d", shardNum),
+			},
+		}...)
+		container.Env = envs
+	}
+}
+
+// newK8sApp builds vmanomaly StatefulSet
+func newK8sApp(cr *vmv1.VMAnomaly, ac *build.AssetsCache) (*appsv1.StatefulSet, error) {
+	podSpec, err := newPodSpec(cr, ac)
+	if err != nil {
+		return nil, err
+	}
+	app := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            build.ShardName(cr),
+			Namespace:       cr.GetNamespace(),
+			Labels:          cr.FinalLabels(),
+			Annotations:     cr.FinalAnnotations(),
+			OwnerReferences: []metav1.OwnerReference{cr.AsOwner()},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: cr.PrefixedName(),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: build.ShardSelectorLabels(cr),
+			},
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+				Type: cr.Spec.RollingUpdateStrategy,
+			},
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      build.ShardPodLabels(cr),
+					Annotations: cr.PodAnnotations(),
+				},
+				Spec: *podSpec,
+			},
+		},
+	}
+	if cr.Spec.PersistentVolumeClaimRetentionPolicy != nil {
+		app.Spec.PersistentVolumeClaimRetentionPolicy = cr.Spec.PersistentVolumeClaimRetentionPolicy
+	}
+	build.StatefulSetAddCommonParams(app, &cr.Spec.CommonAppsParams)
+	app.Spec.Template.Spec.Volumes = append(app.Spec.Template.Spec.Volumes, cr.Spec.Volumes...)
+	if err := cr.Spec.Storage.IntoSTSVolume(cr.GetVolumeName(), &app.Spec); err != nil {
+		return nil, err
+	}
+	app.Spec.VolumeClaimTemplates = append(app.Spec.VolumeClaimTemplates, cr.Spec.ClaimTemplates...)
+	return app, nil
+}
+
+func createOrUpdateVPA(ctx context.Context, rclient client.Client, cr, prevCR *vmv1.VMAnomaly) error {
+	if cr.Spec.VPA == nil {
+		return nil
+	}
+	targetRef := autoscalingv1.CrossVersionObjectReference{
+		Name:       cr.Name,
+		Kind:       "VMAnomaly",
+		APIVersion: "operator.victoriametrics.com/v1",
+	}
+	newVPA := build.VPA(cr, targetRef, cr.Spec.VPA)
+	var prevVPA *vpav1.VerticalPodAutoscaler
+	if prevCR != nil && prevCR.Spec.VPA != nil {
+		prevVPA = build.VPA(prevCR, targetRef, prevCR.Spec.VPA)
+	}
+	owner := cr.AsOwner()
+	return reconcile.VPA(ctx, rclient, newVPA, prevVPA, &owner)
+}
+
+func deleteOrphaned(ctx context.Context, rclient client.Client, cr *vmv1.VMAnomaly) error {
+	keepPodScrapes := sets.New[string]()
+	if !ptr.Deref(cr.Spec.DisableSelfServiceScrape, false) {
+		keepPodScrapes.Insert(cr.PrefixedName())
+	}
+	if err := finalize.RemoveOrphanedVMPodScrapes(ctx, rclient, cr, keepPodScrapes, true); err != nil {
+		return fmt.Errorf("cannot remove podScrapes: %w", err)
+	}
+
+	objMeta := metav1.ObjectMeta{Name: cr.PrefixedName(), Namespace: cr.Namespace}
+	var objsToRemove []client.Object
+	if cr.Spec.NetworkPolicy == nil {
+		objsToRemove = append(objsToRemove, &networkingv1.NetworkPolicy{ObjectMeta: objMeta})
+	}
+	if !cr.IsOwnsServiceAccount() {
+		objsToRemove = append(objsToRemove, &corev1.ServiceAccount{ObjectMeta: objMeta})
+	}
+	if config.MustGetBaseConfig().VPAAPIEnabled {
+		// TODO: drop the cr.Name-named VPA objects deletes after v0.80.0
+		if cr.PrefixedName() != cr.Name {
+			objsToRemove = append(objsToRemove, &vpav1.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: cr.Name, Namespace: cr.Namespace}})
+		}
+		if cr.Spec.VPA == nil {
+			objsToRemove = append(objsToRemove, &vpav1.VerticalPodAutoscaler{ObjectMeta: objMeta})
+		}
+	}
+	return finalize.SafeDeleteWithFinalizer(ctx, rclient, objsToRemove, cr)
+}
+
+func createOrUpdateApp(ctx context.Context, rclient client.Client, cr, prevCR *vmv1.VMAnomaly, newAppTpl, prevAppTpl *appsv1.StatefulSet) error {
+	stsToKeep := sets.New[string]()
+	pdbToKeep := sets.New[string]()
+	shardCount := cr.GetShardCount()
+	prevShardCount := prevCR.GetShardCount()
+
+	isUpscaling := prevShardCount < shardCount
+	if prevCR.IsSharded() {
+		if prevShardCount != shardCount {
+			action := "downscaling"
+			if isUpscaling {
+				action = "upscaling"
+			}
+			logger.WithContext(ctx).Info(fmt.Sprintf("VMAnomaly shard %s from=%d to=%d", action, prevShardCount, shardCount))
+		}
+	}
+
+	var wg sync.WaitGroup
+	type returnValue struct {
+		name string
+		err  error
+	}
+	rtCh := make(chan *returnValue)
+	shardCtx, cancel := context.WithCancel(ctx)
+	owner := cr.AsOwner()
+	updateShard := func(num int32) {
+		var rv returnValue
+		defer func() {
+			rtCh <- &rv
+			wg.Done()
+		}()
+		if cr.Spec.PodDisruptionBudget != nil {
+			pdb := build.ShardPodDisruptionBudget(cr, cr.Spec.PodDisruptionBudget, num)
+			var prevPDB *policyv1.PodDisruptionBudget
+			if prevCR != nil && prevCR.Spec.PodDisruptionBudget != nil {
+				prevPDB = build.ShardPodDisruptionBudget(prevCR, prevCR.Spec.PodDisruptionBudget, num)
+			}
+			if err := reconcile.PDB(ctx, rclient, pdb, prevPDB, &owner); err != nil {
+				rv.err = err
+				return
+			}
+		}
+		newApp, err := getShard(cr, newAppTpl, num)
+		if err != nil {
+			rv.err = fmt.Errorf("failed to get new StatefulSet: %w", err)
+			return
+		}
+		prevApp, err := getShard(prevCR, prevAppTpl, num)
+		if err != nil {
+			rv.err = fmt.Errorf("failed to get prev StatefulSet: %w", err)
+			return
+		}
+		selectorLabels := maps.Clone(newApp.Spec.Selector.MatchLabels)
+		o := reconcile.StatefulSetOpts{
+			SelectorLabels: selectorLabels,
+		}
+		if err := reconcile.StatefulSet(shardCtx, rclient, newApp, prevApp, &owner, &o); err != nil {
+			rv.err = err
+			return
+		}
+		rv.name = newApp.Name
+	}
+	for shardNum := range build.ShardNumIter(isUpscaling, shardCount) {
+		wg.Add(1)
+		go updateShard(shardNum)
+	}
+	go func() {
+		wg.Wait()
+		close(rtCh)
+		cancel()
+	}()
+	var errs []error
+	for r := range rtCh {
+		if r.err != nil {
+			cancel()
+			errs = append(errs, r.err)
+		}
+		if r.name != "" {
+			stsToKeep.Insert(r.name)
+			if cr.Spec.PodDisruptionBudget != nil {
+				pdbToKeep.Insert(r.name)
+			}
+		}
+	}
+	if err := utilerrors.NewAggregate(errs); err != nil {
+		return err
+	}
+	if err := finalize.RemoveOrphanedPDBs(ctx, rclient, cr, pdbToKeep, true); err != nil {
+		return err
+	}
+	if err := finalize.RemoveOrphanedSTSs(ctx, rclient, cr, stsToKeep, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getShard(cr *vmv1.VMAnomaly, appTpl *appsv1.StatefulSet, num int32) (*appsv1.StatefulSet, error) {
+	if appTpl == nil || !cr.IsSharded() {
+		return appTpl, nil
+	}
+	app, err := build.RenderShard(appTpl, num)
+	if err != nil {
+		return nil, fmt.Errorf("cannot fill placeholders for StatefulSet in sharded %T: %w", cr, err)
+	}
+	patchShardContainers(app.Spec.Template.Spec.Containers, num, cr.GetShardCount())
+	return app, nil
+}
+
+func getAssetsCache(ctx context.Context, rclient client.Client, cr *vmv1.VMAnomaly) *build.AssetsCache {
+	cfg := map[build.ResourceKind]*build.ResourceCfg{
+		build.TLSAssetsResourceKind: {
+			MountDir:   tlsAssetsDir,
+			SecretName: build.ResourceName(build.TLSAssetsResourceKind, cr),
+		},
+	}
+	return build.NewAssetsCache(ctx, rclient, cfg)
+}

@@ -1,0 +1,100 @@
+name: Update docs
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'release-*'
+    paths:
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/docs.yaml'
+      - 'hack/*.py'
+
+permissions: {}
+
+concurrency:
+  group: docs-sync
+  cancel-in-progress: false
+
+jobs:
+  update-docs:
+    runs-on:  vm-runner
+    environment:
+      name: docs
+      url: https://docs.victoriametrics.com/operator
+    steps:
+      - name: Checkout operator repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          token: ${{ secrets.VM_BOT_GH_TOKEN }}
+          path: __vm-operator
+          persist-credentials: false
+
+      - name: Checkout docs repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: VictoriaMetrics/vmdocs
+          ref: main
+          token: ${{ secrets.VM_BOT_GH_TOKEN }}
+          path: __vm-docs
+          persist-credentials: true
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: '__vm-operator/go.mod'
+          check-latest: true
+          cache: true
+        id: go
+
+      - name: Import GPG key
+        id: import-gpg
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd  # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.VM_BOT_GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.VM_BOT_PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_config_global: true
+
+      - name: Copy docs
+        id: update
+        run: |
+          REF="$GITHUB_REF_NAME"
+          if [[ "$REF" == "master" ]]; then
+            make docs
+            rsync -zarv \
+              --include="*/" \
+              --exclude="CHANGELOG.md" \
+              --include="*.webp" \
+              --include="*.md" \
+              --exclude="*" \
+              docs/ ../__vm-docs/content/operator/
+            python3 hack/merge_changelog.py \
+              --target=../__vm-docs/content/operator/CHANGELOG.md \
+              --source=docs/CHANGELOG.md \
+              --master
+          elif [[ "$REF" =~ ^release-[0-9]+\.[0-9]+$ ]]; then
+            python3 hack/merge_changelog.py \
+              --target=../__vm-docs/content/operator/CHANGELOG.md \
+              --source=docs/CHANGELOG.md
+          else
+            echo "ref=$REF is not master or an LTS release branch, nothing to do"
+          fi
+          echo "SHORT_SHA=$(git rev-parse --short $GITHUB_SHA)" >> $GITHUB_OUTPUT
+        working-directory: __vm-operator
+
+      - name: Push to vmdocs
+        run: |
+          git config --global user.name "${{ steps.import-gpg.outputs.email }}"
+          git config --global user.email "${{ steps.import-gpg.outputs.email }}"
+          if [[ -n $(git status --porcelain) ]]; then
+            git add content/operator
+            git commit -S -m "sync docs with VictoriaMetrics/operator commit: ${{ steps.update.outputs.SHORT_SHA }}"
+            git push
+          fi
+        working-directory: __vm-docs
+        env:
+          GH_TOKEN: "${{ secrets.VM_BOT_GH_TOKEN }}"
+          GITHUB_TOKEN: "${{ secrets.VM_BOT_GH_TOKEN }}"

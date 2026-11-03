@@ -1,0 +1,536 @@
+---
+weight: 22
+title: VMAnomaly
+menu:
+  docs:
+    identifier: operator-cr-vmanomaly
+    parent: operator-cr
+    weight: 22
+aliases:
+  - /operator/resources/vmanomaly/
+  - /operator/resources/vmanomaly/index.html
+tags:
+  - kubernetes
+  - metrics
+  - logs
+  - anomaly
+---
+`VMAnomaly` - represents [VictoriaMetrics Anomaly Detection](https://docs.victoriametrics.com/anomaly-detection/) configuration {{% available_from "v0.60.0" "operator"%}}.
+
+The `VMAnomaly` CRD declaratively defines a desired Anomaly Detection setup to run in a Kubernetes cluster.
+It provides options to configure [sharding](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/#horizontal-scalability), [replication](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/#high-availability), persistent storage.
+
+For each shard of `VMAnomaly` resource, the Operator deploys a properly configured `StatefulSet` in the same namespace.
+Anomaly Detection pods can either use a configuration Secret created from the value specified in `spec.configRawYaml`, or use an existing secret specified in `spec.configSecret`.
+
+## Configuration
+
+The operator generates a configuration file for `VMAnomaly` based on user input at the definition of [CRD](https://docs.victoriametrics.com/operator/api/#v1-vmanomaly).
+
+The generated configuration is stored in a Secret created by the operator, using the following naming template: `config-vmanomaly-<CRD_NAME>`.
+
+This configuration file is mounted at `VMAnomaly` `Pod`.
+
+**VMAnomaly is enterprise only, license is required for this CRD**. [Trial license can be requested](https://victoriametrics.com/products/enterprise/trial/) for `VMAnomaly` CRD evaluation.
+
+The `VMAnomaly` CRD exposes connection and concurrency settings through typed `spec.reader`, `spec.writer`, and `spec.monitoring` fields. Query definitions and query-level business policies remain in `spec.configRawYaml`, `spec.configSecret`, or selected [`VMAnomalyConfig`](https://docs.victoriametrics.com/operator/resources/vmanomalyconfig/) resources. Models, schedulers, and service settings are also defined in the raw configuration:
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  replicaCount: 2
+  license:
+    key: "xx"
+  configRawYaml: |
+    reader:
+      queries:
+        ingestion_rate:
+          expr: 'sum(rate(vm_rows_inserted_total[5m])) by (type) > 0'
+          step: '1m'
+          data_range: [0, 'inf']
+          detection_direction: above_expected
+          min_rel_dev_from_expected: [0, 15]
+    schedulers:
+      scheduler_periodic_1m:
+        class: "periodic"
+        # class: "periodic" # or class: "scheduler.periodic.PeriodicScheduler" until v1.13.0 with class alias support)
+        infer_every: "1m"
+        fit_every: "1000d" # bootstrap-only; online models update from every inference
+        fit_window: "3h"
+    models:
+      model_univariate_1:
+        class: 'zscore_online'
+        z_threshold: 2.5
+        decay: 0.99 # forgetting factor; lower values adapt faster to recent data
+    settings:
+      n_workers: 8
+      native_threads_per_worker: 1
+  reader:
+    datasourceURL: http://vmsingle-read-example:8428
+    samplingPeriod: 10s
+    workers: 0
+  writer:
+    datasourceURL: http://vmsingle-write-example:8428
+    batchMaxSeries: 1000
+    batchMaxBytes: 4194304
+    metricPrefixCacheMaxEntries: 10000
+  monitoring:
+    push:
+      url: http://vmsingle-monitoring-example:8428
+```
+
+### Reader, Writer and Monitoring
+
+Anomaly Detection [models](https://docs.victoriametrics.com/anomaly-detection/components/models/), [schedulers](https://docs.victoriametrics.com/anomaly-detection/components/scheduler/), [settings](https://docs.victoriametrics.com/anomaly-detection/components/settings/), and `reader.queries` are defined in `spec.configRawYaml` or `spec.configSecret`. Reader connection settings, the reader type (`spec.reader.class`, `vm` by default or `vlogs` for [VictoriaLogs](#using-with-victorialogs)) and `reader.workers` are configured under `spec.reader`; writer and monitoring connection settings are configured under `spec.writer` and `spec.monitoring`.
+
+Starting with vmanomaly v1.30.2, stable KPI policies - `data_range`, `detection_direction`, `min_dev_from_expected`, and `min_rel_dev_from_expected` - should be configured on each `reader.queries.<alias>`. Model-level placement remains compatible but is deprecated. `settings.native_threads_per_worker` remains in the raw `settings` section because `VMAnomaly` does not expose typed service settings. A value of `0` selects the automatic limit for both `spec.reader.workers` and `settings.native_threads_per_worker`.
+
+Starting with vmanomaly v1.30.3, `spec.writer.batchMaxSeries` and `spec.writer.batchMaxBytes` bound VictoriaMetrics import requests, while `spec.writer.metricPrefixCacheMaxEntries` bounds prepared metric-label prefix caching. Set the cache limit to `0` to disable cross-cycle caching. Rendezvous sharding remains opt-in through `spec.extraEnvs` with `VMANOMALY_SHARDING_STRATEGY=RENDEZVOUS`; the existing Operator sharding fields and defaults are unchanged.
+
+This was done to allow to use K8s secrets and configmaps as a source for TLS, basic and bearer secrets for reader, writer and monitoring endpoints. Also structure of this sections differ from Anomaly Detection configuration structure.
+
+Given below reader, writer and monitoring configuration
+
+```yaml
+reader:
+  class: vm
+  datasource_url: http://localhost:8428
+  sampling_period: 10s
+  bearer_token: token
+  queries:
+    vmb:
+      expr: avg(vm_blocks)
+      step: 10s
+      data_range: ['-inf', 'inf']
+      tz: UTC
+writer:
+  class: vm
+  datasource_url: http://localhost:8428/
+  tenant_id: 0:0
+  metric_format:
+    __name__: vmanomaly_$VAR
+    for: $QUERY_KEY
+    run: test_metric_format
+    config: io_vm_single.yaml
+  import_json_path: /api/v1/import
+  health_path: health
+  user: foo
+  password: bar
+  tls_cert_file: cert-file
+  tls_key_file: key-file
+monitoring:
+  pull:
+    addr: 0.0.0.0
+    port: 8080
+  push:
+    url: http://localhost:8480/
+    tenant_id: 0:0
+    user: USERNAME
+    password: PASSWORD
+    verify_tls: False
+    timeout: 5s
+    push_frequency: 15m
+    extra_labels:
+      job: vmanomaly-push
+      test: test-1
+```
+
+maps into VMAnomaly CR
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  reader:
+    class: vm
+    datasourceURL: http://localhost:8428
+    samplingPeriod: 10s
+    bearer:
+      bearerTokenSecret:
+        name: k8s-secret-name
+        key: token-secret-key
+  writer:
+    datasourceURL: http://localhost:8428/
+    tenantID: 0:0
+    metricFormat:
+      name: vmanomaly_$VAR
+      for: $QUERY_KEY
+      extraLabels:
+        run: test_metric_format
+        config: io_vm_single.yaml
+    importJsonPath: /api/v1/import
+    healthPath: health
+    basicAuth:
+      username:
+        name: k8s-basic-auth-secret-name
+        key: username-secret-key
+      password:
+        name: k8s-basic-auth-secret-name
+        key: password-secret-key
+    tlsConfig:
+      cert:
+        name: k8s-tls-secret-name
+        key: tls-cert-key
+      keySecret:
+        name: k8s-tls-secret-name
+        key: tls-key
+  monitoring:
+    pull:
+      addr: 0.0.0.0
+      port: 8080
+    push:
+      url: http://localhost:8480/
+      tenantID: 0:0
+      username:
+        name: k8s-basic-auth-secret-name
+        key: username-secret-key
+      password:
+        name: k8s-basic-auth-secret-name
+        key: password-secret-key
+      tlsConfig:
+        insecureSkipVerify: true
+      timeout: 5s
+      pushFrequency: 15m
+      extraLabels:
+        job: vmanomaly-push
+        test: test-1
+  configRawYaml: |
+    reader:
+      queries:
+        vmb:
+          expr: avg(vm_blocks)
+          step: 10s
+          data_range: ['-inf', 'inf']
+          tz: UTC
+```
+
+### Using secret
+
+Configuration can be defined in a manually created `Secret`, which must be created before `VMAnomaly` resource.
+
+`Secret` selector must be defined at `VMAnomaly` `spec.configSecret` option:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anomaly-config
+  labels:
+    app: vm-operator
+type: Opaque
+stringData:
+  config.yaml: |
+    reader:
+      queries:
+        ingestion_rate:
+          expr: 'sum(rate(vm_rows_inserted_total[5m])) by (type) > 0'
+          step: '1m'
+    schedulers:
+      scheduler_periodic_1m:
+        class: "periodic"
+        # class: "periodic" # or class: "scheduler.periodic.PeriodicScheduler" until v1.13.0 with class alias support)
+        infer_every: "1m"
+        fit_every: "1000d" # bootstrap-only; online models update from every inference
+        fit_window: "3h"
+    models:
+      model_univariate_1:
+        class: 'zscore_online'
+        z_threshold: 2.5
+        decay: 0.99 # forgetting factor; lower values adapt faster to recent data
+
+---
+
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  replicaCount: 2
+  license:
+    key: "xx"
+  reader:
+    datasourceURL: http://vmsingle-read-example:8428
+    samplingPeriod: 10s
+  writer:
+    datasourceURL: http://vmsingle-write-example:8428
+  configSecret:
+    name: anomaly-config
+    key: config.yaml
+```
+
+### Using inline raw config
+
+Alternatively configuration can be defined as a `spec.configRawYaml` property value of `VMAnomaly` resource:
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  replicaCount: 2
+  reader:
+    datasourceURL: http://vmsingle-read-example:8428
+    samplingPeriod: 10s
+  writer:
+    datasourceURL: http://vmsingle-write-example:8428
+  license:
+    key: "xx"
+  configRawYaml: |
+    reader:
+      queries:
+        ingestion_rate:
+          expr: 'sum(rate(vm_rows_inserted_total[5m])) by (type) > 0'
+          step: '1m'
+    schedulers:
+      scheduler_periodic_1m:
+        class: "periodic"
+        # class: "periodic" # or class: "scheduler.periodic.PeriodicScheduler" until v1.13.0 with class alias support)
+        infer_every: "1m"
+        fit_every: "1000d" # bootstrap-only; online models update from every inference
+        fit_window: "3h"
+    models:
+      model_univariate_1:
+        class: 'zscore_online'
+        z_threshold: 2.5
+        decay: 0.99 # forgetting factor; lower values adapt faster to recent data
+```
+
+If both `configSecret` and `configRawYaml` are defined, only configuration from `configRawYaml` will be used. Values from `configSecret` will be ignored.
+
+### Using with VictoriaLogs
+
+By default, `VMAnomaly` reads from VictoriaMetrics (`spec.reader.class: vm`). To read from [VictoriaLogs](https://docs.victoriametrics.com/victorialogs/) instead, set `spec.reader.class: vlogs` and point `spec.reader.datasourceURL` to VictoriaLogs. Queries in `reader.queries` must then be LogsQL queries with the [`stats` pipe](https://docs.victoriametrics.com/victorialogs/logsql/#stats-pipe), which turns logs into the numeric series that models need. Results are still written to VictoriaMetrics via `spec.writer`. See the [VictoriaLogs reader](https://docs.victoriametrics.com/anomaly-detection/components/reader/#victorialogs-reader) docs for supported query options.
+
+> The operator does not check that queries match the reader class. A `VMAnomaly` with the `vm` class runs MetricsQL queries from selected `VMAnomalyConfig` objects against VictoriaMetrics, and a `vlogs` one runs LogsQL queries against VictoriaLogs, without any error from the operator. If both classes are used, select `VMAnomalyConfig` objects by distinct labels or namespaces for each class. Don't use `selectAllByDefault: true` with empty selectors, since it selects every `VMAnomalyConfig`.
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: vmanomaly-vlogs
+spec:
+  license:
+    keyRef:
+      name: k8s-secret-that-contains-license
+      key: key-in-a-secret-that-contains-license
+  configSelector:
+    matchLabels:
+      reader: vlogs
+  reader:
+    class: vlogs
+    datasourceURL: http://vlsingle-example:9428
+    samplingPeriod: 1m
+  writer:
+    datasourceURL: http://vmsingle-example:8428
+  configRawYaml: |
+    reader:
+      queries:
+        logs_rate:
+          expr: '* | stats count() as logs'
+          step: '1m'
+    schedulers:
+      scheduler_periodic_1m:
+        class: "periodic"
+        infer_every: "1m"
+        fit_every: "2m"
+        fit_window: "3h"
+    models:
+      model_univariate_1:
+        class: 'zscore'
+        z_threshold: 2.5
+```
+
+## High Availability and Sharding
+
+Anomaly Detection can be deployed in [HA mode](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/#high-availability) and scaled horizontally. Horizontal scaling is achieved by [automatically splitting the configuration into shards](https://new.docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/#sub-configuration) using the `spec.shardCount` parameter. The `spec.replicaCount` parameter defines the number of replicas per shard. The Operator creates one StatefulSet per shard (equal to `spec.shardCount`), with each StatefulSet containing `spec.replicaCount` replicas.
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  replicaCount: 2
+  shardCount: 2
+  reader:
+    datasourceURL: http://vmsingle-read-example:8428
+    samplingPeriod: 10s
+  writer:
+    datasourceURL: http://vmsingle-write-example:8428
+  license:
+    key: "xx"
+  configRawYaml: |
+    reader:
+      queries:
+        ingestion_rate:
+          expr: 'sum(rate(vm_rows_inserted_total[5m])) by (type) > 0'
+          step: '1m'
+        ingestion_failed:
+          expr: 'sum(rate(vm_rows_failed[5m])) by (type) > 0'
+          step: '1m'
+    schedulers:
+      scheduler_periodic_1m:
+        class: "periodic"
+        # class: "periodic" # or class: "scheduler.periodic.PeriodicScheduler" until v1.13.0 with class alias support)
+        infer_every: "1m"
+        fit_every: "1000d" # bootstrap-only; online models update from every inference
+        fit_window: "3h"
+    models:
+      model_univariate_1:
+        class: 'zscore_online'
+        z_threshold: 2.5
+        decay: 0.99 # forgetting factor; lower values adapt faster to recent data
+```
+
+## Dynamic configuration
+
+`VMAnomaly` supports discovering additional models, schedulers, and queries using [VMAnomalyConfig](https://docs.victoriametrics.com/operator/resources/vmanomalyconfig/).
+
+For filtering configuration objects, `VMAnomaly` uses `configNamespaceSelector` and `configSelector` selectors. This enables users to associate multiple VMAnomalyConfigs with multiple VMAnomaly instances (a many-to-many relationship).
+
+It allows configuring object access control across namespaces and different environments.
+See [this doc](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#labelselector-v1-meta) for the specification of selectors.
+
+In addition to the above selectors, object filtering in a cluster is affected by the field `selectAllByDefault` of `VMAnomaly` spec and the `WATCH_NAMESPACE` environment variable for the operator.
+
+Following rules are applied:
+
+- If `configNamespaceSelector` and `configSelector` are both undefined, nothing is selected. Setting `spec.selectAllByDefault: true` selects all VMAnomalyConfigs.
+- If `configNamespaceSelector` is defined and `configSelector` is undefined, all VMAnomalyConfigs in the namespaces matched by `configNamespaceSelector` are selected.
+- If `configNamespaceSelector` is undefined and `configSelector` is defined, VMAnomalyConfigs matching `configSelector` in the `VMAnomaly` namespace are selected.
+- If `configNamespaceSelector` and `configSelector` are both defined, VMAnomalyConfigs matching `configSelector` in the namespaces matched by `configNamespaceSelector` are selected.
+- `selectAllByDefault` has an effect only when both `configNamespaceSelector` and `configSelector` are undefined.
+- An empty `configNamespaceSelector` (`{}`) matches all namespaces. If `configNamespaceSelector` matches no namespaces, nothing is selected.
+- If the operator's `WATCH_NAMESPACE` is set, `configNamespaceSelector` is ignored and VMAnomalyConfigs are selected from all watched namespaces, not only from the `VMAnomaly` namespace. This also applies when only `configSelector` is defined.
+
+Below is a more visual and detailed view:
+
+| `configNamespaceSelector` | `configSelector` | `selectAllByDefault` | `WATCH_NAMESPACE` | Selected objects                                                                                  |
+|---------------------------|------------------|----------------------|-------------------|---------------------------------------------------------------------------------------------------|
+| undefined                 | undefined        | false                | *any*             | nothing                                                                                           |
+| undefined                 | undefined        | **true**             | undefined         | all VMAnomalyConfigs in the cluster                                                               |
+| **defined**               | undefined        | *any*                | undefined         | all VMAnomalyConfigs in the namespaces matched by `configNamespaceSelector`                       |
+| undefined                 | **defined**      | *any*                | undefined         | VMAnomalyConfigs matching `configSelector` in the `VMAnomaly` namespace                           |
+| **defined**               | **defined**      | *any*                | undefined         | VMAnomalyConfigs matching `configSelector` in the namespaces matched by `configNamespaceSelector` |
+| undefined                 | undefined        | **true**             | **defined**       | all VMAnomalyConfigs in the watched namespaces                                                    |
+| **defined**               | undefined        | *any*                | **defined**       | all VMAnomalyConfigs in the watched namespaces                                                    |
+| *any*                     | **defined**      | *any*                | **defined**       | VMAnomalyConfigs matching `configSelector` in the watched namespaces                              |
+
+See [this doc](https://docs.victoriametrics.com/operator/configuration/#namespaced-mode) for more details about the `WATCH_NAMESPACE` variable.
+
+## Version management
+
+To set `VMAnomaly` version add `spec.image.tag` name from [releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  image:
+    tag: v1.24.0
+    pullPolicy: Always
+  # ...
+```
+
+Also, you can specify `imagePullSecrets` if you are pulling images from private repo:
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  image:
+    tag: v1.24.0
+    pullPolicy: Always
+  imagePullSecrets:
+    - name: my-repo-secret
+# ...
+```
+
+## Resource management
+
+You can specify resources for each `VMAnomaly` resource in the `spec` section of the `VMAnomaly` CRD.
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: resources-example
+spec:
+  # ...
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 250m
+    limits:
+      memory: 128Mi
+      cpu: 500m
+  # ...
+```
+
+If these parameters are not specified, then,
+by default all `VMAnomaly` pods have resource requests and limits from the default values of the following [operator parameters](https://docs.victoriametrics.com/operator/configuration/):
+
+- `VM_VMANOMALY_RESOURCE_LIMIT_MEM` - default memory limit for `VMAnomaly` pods,
+- `VM_VMANOMALY_RESOURCE_LIMIT_CPU` - default memory limit for `VMAnomaly` pods,
+- `VM_VMANOMALY_RESOURCE_REQUEST_MEM` - default memory limit for `VMAnomaly` pods,
+- `VM_VMANOMALY_RESOURCE_REQUEST_CPU` - default memory limit for `VMAnomaly` pods.
+
+These default parameters will be used if:
+
+- `VM_VMANOMALY_USEDEFAULTRESOURCES` is set to `true` (default value),
+- `VMAnomaly` CR doesn't have `resources` field in `spec` section.
+
+Field `resources` in `VMAnomaly` spec have higher priority than operator parameters.
+
+If you set `VM_VMANOMALY_USEDEFAULTRESOURCES` to `false` and don't specify `resources` in `VMAnomaly` CRD,
+then `VMAnomaly` pods will be created without resource requests and limits.
+
+Also, you can specify requests without limits - in this case default values for limits will not be used.
+
+## Examples
+
+Below is an example of VMAnomaly setup with [periodic scheduler](https://docs.victoriametrics.com/anomaly-detection/components/scheduler/#periodic-scheduler), online [z-score model](https://docs.victoriametrics.com/anomaly-detection/components/models/#z-score), that is applied against data extracted using given `ingestion_rate` query from `http://vmsingle-read-example:8428` endpoint
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1
+kind: VMAnomaly
+metadata:
+  name: example
+spec:
+  replicaCount: 1
+  license:
+    key: "xx"
+  reader:
+    datasourceURL: http://vmsingle-read-example:8428
+    samplingPeriod: 10s
+  writer:
+    datasourceURL: http://vmsingle-write-example:8428
+  configRawYaml: |-
+    reader:
+      queries:
+        ingestion_rate:
+          expr: 'sum(rate(vm_rows_inserted_total[5m])) by (type) > 0'
+          step: '1m'
+    schedulers:
+      scheduler_periodic_1m:
+        class: "periodic"
+        # class: "periodic" # or class: "scheduler.periodic.PeriodicScheduler" until v1.13.0 with class alias support)
+        infer_every: "1m"
+        fit_every: "1000d" # bootstrap-only; online models update from every inference
+        fit_window: "3h"
+    models:
+      model_univariate_1:
+        class: 'zscore_online'
+        z_threshold: 2.5
+        decay: 0.99 # forgetting factor; lower values adapt faster to recent data
+```
